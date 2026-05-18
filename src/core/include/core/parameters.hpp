@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/mesh2splat.hpp"
 
 #include <algorithm>
 #include <array>
@@ -285,6 +286,18 @@ namespace lfs::core {
             int sog_iterations = 10;
             bool overwrite = false;            // Skip overwrite prompts
             std::vector<float> rad_lod_levels; // LOD levels for RAD format (as ratios, e.g., 0.5f = 50%)
+        };
+
+        // Parameters for the mesh2splat command
+        struct LFS_CORE_API Mesh2SplatParameters {
+            std::filesystem::path input_path;
+            std::filesystem::path output_path; // Empty = derive from input
+            OutputFormat format = OutputFormat::PLY;
+            std::vector<OutputFormat> formats{OutputFormat::PLY};
+            Mesh2SplatOptions options;
+            int sog_iterations = 10;
+            bool overwrite = false;
+            std::vector<float> rad_lod_levels;
         };
 
         // Modern C++23 functions returning expected values

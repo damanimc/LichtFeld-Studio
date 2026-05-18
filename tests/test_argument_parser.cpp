@@ -7,8 +7,10 @@
 #include "core/argument_parser.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <string>
+#include <variant>
 
 namespace {
 
@@ -77,4 +79,65 @@ TEST(ArgumentParserTest, MaxWidthZeroDisablesCapExplicitly) {
     ASSERT_TRUE(parsed.has_value()) << parsed.error();
 
     EXPECT_EQ((*parsed)->dataset.max_width, 0);
+}
+
+TEST(ArgumentParserTest, Mesh2SplatParsesOutputPathAndOptions) {
+    const auto dir = make_test_path("lfs_mesh2splat_arg_parser");
+    const auto input = std::filesystem::path(dir) / "input.obj";
+    const auto output = std::filesystem::path(dir) / "output.spz";
+    std::ofstream(input).put('\n');
+
+    const std::string input_str = input.string();
+    const std::string output_str = output.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "mesh2splat",
+        input_str.c_str(),
+        "--output",
+        output_str.c_str(),
+        "--resolution",
+        "512",
+        "--sigma",
+        "0.5"};
+
+    auto parsed = lfs::core::args::parse_args(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    auto* mode = std::get_if<lfs::core::args::Mesh2SplatMode>(&*parsed);
+    ASSERT_NE(mode, nullptr);
+    EXPECT_EQ(mode->params.input_path, input);
+    EXPECT_EQ(mode->params.output_path, output);
+    EXPECT_EQ(mode->params.format, lfs::core::param::OutputFormat::SPZ);
+    ASSERT_EQ(mode->params.formats.size(), 1u);
+    EXPECT_EQ(mode->params.formats[0], lfs::core::param::OutputFormat::SPZ);
+    EXPECT_EQ(mode->params.options.resolution_target, 512);
+    EXPECT_FLOAT_EQ(mode->params.options.sigma, 0.5f);
+}
+
+TEST(ArgumentParserTest, Mesh2SplatParsesMultipleOutputFormats) {
+    const auto dir = make_test_path("lfs_mesh2splat_multi_format_arg_parser");
+    const auto input = std::filesystem::path(dir) / "input.obj";
+    const auto output = std::filesystem::path(dir) / "output";
+    std::ofstream(input).put('\n');
+
+    const std::string input_str = input.string();
+    const std::string output_str = output.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "mesh2splat",
+        input_str.c_str(),
+        "--output",
+        output_str.c_str(),
+        "--format",
+        "ply,spz,html"};
+
+    auto parsed = lfs::core::args::parse_args(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    auto* mode = std::get_if<lfs::core::args::Mesh2SplatMode>(&*parsed);
+    ASSERT_NE(mode, nullptr);
+    ASSERT_EQ(mode->params.formats.size(), 3u);
+    EXPECT_EQ(mode->params.formats[0], lfs::core::param::OutputFormat::PLY);
+    EXPECT_EQ(mode->params.formats[1], lfs::core::param::OutputFormat::SPZ);
+    EXPECT_EQ(mode->params.formats[2], lfs::core::param::OutputFormat::HTML);
 }
