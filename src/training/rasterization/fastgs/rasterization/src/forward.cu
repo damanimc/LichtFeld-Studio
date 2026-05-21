@@ -126,22 +126,21 @@ namespace {
             return {};
         }
 
-        return
-            "FastGS forward " + std::string(phase) +
-            " detected invalid rasterization state: " +
-            describe_fastgs_forward_flags(status.flags) +
-            " (flags=" + std::to_string(status.flags) +
-            ", source_index=" + std::to_string(status.source_index) +
-            ", tile_index=" + std::to_string(status.tile_index) +
-            ", expected=" + std::to_string(status.expected_count) +
-            ", actual=" + std::to_string(status.actual_count) +
-            ", value=" + std::to_string(status.value) +
-            ", bounds=[" + std::to_string(status.bounds_x) + "," +
-            std::to_string(status.bounds_y) + "," +
-            std::to_string(status.bounds_z) + "," +
-            std::to_string(status.bounds_w) + "]" +
-            ", n_primitives=" + std::to_string(n_primitives) +
-            ", n_tiles=" + std::to_string(n_tiles) + ")";
+        return "FastGS forward " + std::string(phase) +
+               " detected invalid rasterization state: " +
+               describe_fastgs_forward_flags(status.flags) +
+               " (flags=" + std::to_string(status.flags) +
+               ", source_index=" + std::to_string(status.source_index) +
+               ", tile_index=" + std::to_string(status.tile_index) +
+               ", expected=" + std::to_string(status.expected_count) +
+               ", actual=" + std::to_string(status.actual_count) +
+               ", value=" + std::to_string(status.value) +
+               ", bounds=[" + std::to_string(status.bounds_x) + "," +
+               std::to_string(status.bounds_y) + "," +
+               std::to_string(status.bounds_z) + "," +
+               std::to_string(status.bounds_w) + "]" +
+               ", n_primitives=" + std::to_string(n_primitives) +
+               ", n_tiles=" + std::to_string(n_tiles) + ")";
     }
 
     bool try_read_fastgs_forward_status(
