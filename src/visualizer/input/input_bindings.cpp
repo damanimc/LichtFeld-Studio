@@ -7,8 +7,11 @@
 #include "core/path_utils.hpp"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <shlobj.h>
@@ -50,6 +53,34 @@ namespace lfs::vis::input {
             ToolMode::ALIGN,
             ToolMode::CROP_BOX,
         };
+
+        [[nodiscard]] std::string toLowerCopy(std::string_view s) {
+            std::string out(s);
+            std::transform(out.begin(), out.end(), out.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            return out;
+        }
+
+        // Look up an Action by case-insensitive description match. Used to
+        // migrate stored profiles whose integer action IDs no longer line up
+        // with the current enum (when entries were inserted/removed between
+        // versions, the IDs shift but the descriptions stay stable).
+        [[nodiscard]] std::optional<Action> findActionByDescription(std::string_view description) {
+            static const auto* const table = [] {
+                auto* const m = new std::unordered_map<std::string, Action>();
+                constexpr int kActionCount = static_cast<int>(Action::DEPTH_ADJUST_NEAR) + 1;
+                for (int i = 0; i < kActionCount; ++i) {
+                    const auto a = static_cast<Action>(i);
+                    m->emplace(toLowerCopy(getActionName(a)), a);
+                }
+                return m;
+            }();
+            const auto it = table->find(toLowerCopy(description));
+            if (it == table->end()) {
+                return std::nullopt;
+            }
+            return it->second;
+        }
 
         [[nodiscard]] bool isSelectionDepthAction(const Action action) {
             switch (action) {
@@ -335,6 +366,24 @@ namespace lfs::vis::input {
                 binding.mode = static_cast<ToolMode>(b.value("mode", 0));
                 binding.action = static_cast<Action>(b["action"].get<int>());
                 binding.description = b.value("description", getActionName(binding.action));
+
+                // Cross-version safeguard: if the stored description doesn't
+                // match the current name for that integer action, the enum was
+                // reshuffled between profile saves — re-resolve by description
+                // so the binding still drives the intended action.
+                if (b.contains("description")) {
+                    const auto stored_desc = b["description"].get<std::string>();
+                    const auto current_name = getActionName(binding.action);
+                    if (toLowerCopy(stored_desc) != toLowerCopy(current_name)) {
+                        if (const auto remapped = findActionByDescription(stored_desc)) {
+                            LOG_INFO("Profile binding remap: '{}' was action {} ({}), now {} ({})",
+                                     stored_desc, static_cast<int>(binding.action), current_name,
+                                     static_cast<int>(*remapped), getActionName(*remapped));
+                            binding.action = *remapped;
+                            binding.description = getActionName(*remapped);
+                        }
+                    }
+                }
 
                 const std::string trigger_type = b["trigger_type"];
                 if (trigger_type == "key") {
@@ -1537,10 +1586,12 @@ namespace lfs::vis::input {
 
         static constexpr ActionDescriptor d_node_pick{
             .allowed_kinds = K::TRIGGER_KIND_MOUSE_BUTTON,
+            .allows_extra_modifiers = true,
             .ui_section = ActionSection::NodePicking,
         };
         static constexpr ActionDescriptor d_node_rect{
             .allowed_kinds = K::TRIGGER_KIND_MOUSE_DRAG,
+            .allows_extra_modifiers = true,
             .ui_section = ActionSection::NodePicking,
         };
 

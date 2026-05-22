@@ -174,7 +174,11 @@ namespace lfs::vis {
     }
 
     lfs::rendering::RenderingEngine* RenderingManager::getRenderingEngine() {
-        if (!initialized_) {
+        // The Vulkan path sets initialized_ without creating engine_ — it only
+        // builds the auxiliary CPU engine lazily for point-cloud renders. Other
+        // callers (camera frustum picking, masked depth queries) still need it,
+        // so create it on demand here too.
+        if (!engine_) {
             initialize();
         }
         return engine_.get();

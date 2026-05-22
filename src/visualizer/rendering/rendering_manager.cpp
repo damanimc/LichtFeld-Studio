@@ -85,7 +85,10 @@ namespace lfs::vis {
     }
 
     void RenderingManager::initialize() {
-        if (initialized_)
+        // Gate on engine_ rather than initialized_: the Vulkan path flips
+        // initialized_ on first frame without building the auxiliary engine,
+        // and getRenderingEngine() relies on this to lazy-create it on demand.
+        if (engine_)
             return;
 
         LOG_TIMER("RenderingEngine initialization");

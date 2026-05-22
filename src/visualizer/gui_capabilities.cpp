@@ -355,6 +355,11 @@ namespace lfs::vis::cap {
                 scene_manager.addToSelection(name);
             return {};
         }
+        if (mode == "remove") {
+            for (const auto& name : names)
+                scene_manager.removeFromSelection(name);
+            return {};
+        }
         if (mode != "replace")
             return std::unexpected("Unsupported node selection mode: " + std::string(mode));
 

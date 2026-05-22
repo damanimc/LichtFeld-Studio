@@ -5204,6 +5204,29 @@ namespace lfs::vis::gui {
             tool->renderUI(ctx, nullptr);
         }
 
+        // Node rectangle-drag outline. Uses the same ScreenOverlayRenderer path
+        // as the cursor preview / align tool so it stays consistent with the
+        // other native viewport overlays.
+        if (auto* const ic = ctx.viewer->getInputController();
+            !ui_hidden_ && ic && ic->isNodeRectDragging()) {
+            if (auto* const rm = ctx.viewer->getRenderingManager()) {
+                if (auto* const overlay = rm->getScreenOverlayRenderer();
+                    overlay && overlay->isFrameActive()) {
+                    const glm::vec2 s = ic->getNodeRectStart();
+                    const glm::vec2 e = ic->getNodeRectEnd();
+                    const glm::vec2 tl{std::min(s.x, e.x), std::min(s.y, e.y)};
+                    const glm::vec2 br{std::max(s.x, e.x), std::max(s.y, e.y)};
+                    if (br.x - tl.x > 0.5f && br.y - tl.y > 0.5f) {
+                        const auto& warn = theme().palette.warning;
+                        const lfs::rendering::OverlayColor fill{warn.x, warn.y, warn.z, warn.w * 0.15f};
+                        const lfs::rendering::OverlayColor stroke{warn.x, warn.y, warn.z, warn.w * 0.85f};
+                        overlay->addRectFilled(tl, br, fill);
+                        overlay->addRect(tl, br, stroke, 2.0f);
+                    }
+                }
+            }
+        }
+
         const bool mouse_over_ui = guiFocusState().want_capture_mouse;
         if (!ui_hidden_ && !mouse_over_ui && viewport_layout_.size.x > 0 && viewport_layout_.size.y > 0) {
             auto* rm = ctx.viewer->getRenderingManager();
@@ -5518,16 +5541,6 @@ namespace lfs::vis::gui {
         auto* align_tool = ctx.viewer->getAlignTool();
         if (align_tool && align_tool->isEnabled() && !ui_hidden_) {
             align_tool->renderUI(ctx, nullptr);
-        }
-
-        if (auto* const ic = ctx.viewer->getInputController();
-            !ui_hidden_ && ic && ic->isNodeRectDragging()) {
-            const auto start = ic->getNodeRectStart();
-            const auto end = ic->getNodeRectEnd();
-            const auto& t = theme();
-            auto* const draw_list = ImGui::GetForegroundDrawList();
-            draw_list->AddRectFilled({start.x, start.y}, {end.x, end.y}, toU32WithAlpha(t.palette.warning, 0.15f));
-            draw_list->AddRect({start.x, start.y}, {end.x, end.y}, toU32WithAlpha(t.palette.warning, 0.85f), 0.0f, 0, 2.0f);
         }
     }
 

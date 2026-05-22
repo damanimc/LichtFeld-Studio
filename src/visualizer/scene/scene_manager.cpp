@@ -1004,6 +1004,18 @@ namespace lfs::vis {
             services().renderingOrNull()->triggerSelectionFlash();
     }
 
+    void SceneManager::removeFromSelection(const std::string& name) {
+        const core::NodeId id = scene_.getNodeIdByName(name);
+        if (id == core::NULL_NODE)
+            return;
+        if (!selection_.isNodeSelected(id))
+            return;
+        selection_.removeFromSelection(id);
+        python::invalidate_poll_caches(1);
+        if (services().renderingOrNull())
+            services().renderingOrNull()->triggerSelectionFlash();
+    }
+
     void SceneManager::clearSelection() {
         selection_.clearNodeSelection();
         python::invalidate_poll_caches(1);
