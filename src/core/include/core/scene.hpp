@@ -43,7 +43,8 @@ namespace lfs::core {
         IMAGE,          // Individual image file reference (not loaded, just path)
         MESH,           // Triangle mesh (imported via Assimp, processed via OpenMesh)
         KEYFRAME_GROUP, // Container for keyframe nodes (camera animation)
-        KEYFRAME        // Individual camera animation keyframe
+        KEYFRAME,       // Individual camera animation keyframe
+        PLY_SEQUENCE    // Container for ordered PLY sequence frames
     };
 
     struct CropBoxData {
@@ -185,6 +186,11 @@ namespace lfs::core {
         void addNode(const std::string& name, std::unique_ptr<lfs::core::SplatData> model);
         void removeNode(const std::string& name, bool keep_children = false);
         void replaceNodeModel(const std::string& name, std::unique_ptr<lfs::core::SplatData> model);
+        // Swap a node's model in place, returning the previous model so the caller can
+        // recycle its (e.g. Vulkan-external) backing storage. Cheap: no disk/parse/upload,
+        // just a pointer swap + MODEL_CHANGED. Used by the PLY-sequence streaming player.
+        [[nodiscard]] std::unique_ptr<lfs::core::SplatData> swapNodeModel(
+            const std::string& name, std::unique_ptr<lfs::core::SplatData> model);
         void setNodeVisibility(const std::string& name, bool visible);
         void setNodeLocked(const std::string& name, bool locked);
         void setNodeTransform(const std::string& name, const glm::mat4& transform);
@@ -194,6 +200,8 @@ namespace lfs::core {
         std::pair<std::string, std::string> cycleVisibilityWithNames();
 
         NodeId addGroup(const std::string& name, NodeId parent = NULL_NODE);
+        NodeId addPlySequence(const std::string& name, NodeId parent = NULL_NODE, size_t frame_count = 0);
+        NodeId addSplatPlaceholder(const std::string& name, NodeId parent = NULL_NODE);
         NodeId addSplat(const std::string& name, std::unique_ptr<lfs::core::SplatData> model, NodeId parent = NULL_NODE);
         NodeId addPointCloud(const std::string& name, std::shared_ptr<lfs::core::PointCloud> point_cloud, NodeId parent = NULL_NODE);
         NodeId addMesh(const std::string& name, std::shared_ptr<lfs::core::MeshData> mesh_data, NodeId parent = NULL_NODE);
