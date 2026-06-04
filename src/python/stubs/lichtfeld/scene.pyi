@@ -117,6 +117,8 @@ class NodeType(enum.Enum):
 
     GROUP = 2
 
+    PLY_SEQUENCE = 13
+
     CROPBOX = 3
 
     ELLIPSOID = 4

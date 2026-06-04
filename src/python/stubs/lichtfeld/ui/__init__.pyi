@@ -2319,6 +2319,13 @@ class SequencerUIState:
     def show_film_strip(self, arg: bool, /) -> None: ...
 
     @property
+    def sequence_fps(self) -> float:
+        """Playback FPS for loaded PLY sequences"""
+
+    @sequence_fps.setter
+    def sequence_fps(self, arg: float, /) -> None: ...
+
+    @property
     def selected_keyframe(self) -> int: ...
 
 def get_sequencer_state() -> SequencerUIState:
