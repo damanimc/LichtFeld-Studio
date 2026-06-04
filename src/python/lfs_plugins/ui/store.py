@@ -239,6 +239,7 @@ class RuntimeState:
     splat_simplify_state = StateSignal[dict[str, object]]("splat_simplify_state", {})
     scripts_generation = StateSignal[int]("scripts_generation", 0)
     language_generation = StateSignal[int]("language_generation", 0)
+    render_settings_generation = StateSignal[int]("render_settings_generation", 0)
 
     # Compatibility names from the old AppState surface.
     is_training = training_running

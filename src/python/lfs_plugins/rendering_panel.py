@@ -311,6 +311,7 @@ class RenderingPanel(Panel):
             RuntimeState.language_generation,
         )
         self._reactive_binding.set_handle(self._handle).watch(*native_signals)
+        self._reactive_binding.watch(RuntimeState.render_settings_generation, dirty="*")
 
     def _unsubscribe_reactive_state(self):
         self._reactive_binding.close()
