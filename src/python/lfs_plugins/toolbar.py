@@ -1081,7 +1081,9 @@ class _ViewportToolbarController:
     def __init__(self):
         self._gizmo = _GizmoToolbarController()
         self._depth_view_controls = DepthViewControlsController()
-        self._viewport_export_controls = ViewportExportControlsController()
+        self._viewport_export_controls = ViewportExportControlsController(
+            self._on_viewport_export_visibility_changed
+        )
         self._utility = _UtilityToolbarController(lambda: self._viewport_export_controls.visible)
         self._selection_controls = SelectionControlsController()
         self._transform_controls = TransformControlsController()
@@ -1199,6 +1201,11 @@ class _ViewportToolbarController:
                 request_redraw()
         except Exception:
             pass
+
+    def _on_viewport_export_visibility_changed(self):
+        self._last_toolbar_signature = None
+        self._sync_toolbar_state()
+        self._sync_tool_overlays_now()
 
     def _mount_key(self, doc):
         body = doc.get_element_by_id("overlay-body")
@@ -1441,7 +1448,7 @@ class _ViewportToolbarController:
         if action == "toggle_viewport_export":
             self._utility.close_group()
             self._gizmo.clear_active_horizontal_tool()
-            self._viewport_export_controls.toggle()
+            self._viewport_export_controls.toggle(notify=False)
             self._last_toolbar_signature = None
             self._sync_toolbar_state()
             self._sync_tool_overlays_now()
@@ -1457,13 +1464,13 @@ class _ViewportToolbarController:
             "crop_apply",
         }:
             self._utility.close_group()
-            self._viewport_export_controls.close()
+            self._viewport_export_controls.close(notify=False)
             self._gizmo.dispatch(action, value)
         else:
             if action == "render_group" and self._utility.active_group != "render":
                 self._gizmo.clear_active_horizontal_tool()
             if action == "toggle_depth_view":
-                self._viewport_export_controls.close()
+                self._viewport_export_controls.close(notify=False)
             self._utility.dispatch(action, value)
         self._last_toolbar_signature = None
         self._sync_toolbar_state()

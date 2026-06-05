@@ -95,8 +95,9 @@ class ViewportExportControlsController:
         "viewport_export_has_status",
     )
 
-    def __init__(self):
+    def __init__(self, on_visibility_changed=None):
         self._handle = None
+        self._on_visibility_changed = on_visibility_changed
         self._visible = False
         self._has_scene = False
         self._is_exporting = False
@@ -221,17 +222,28 @@ class ViewportExportControlsController:
         self._cancel_status_timer()
         self._current_doc = None
 
-    def toggle(self):
-        self._visible = not self._visible
+    def toggle(self, notify=True):
+        self._set_visible(not self._visible, notify=notify)
+
+    def close(self, notify=True):
+        self._set_visible(False, notify=notify)
+
+    def _set_visible(self, visible, notify=True):
+        visible = bool(visible)
+        if self._visible == visible:
+            return
+        self._visible = visible
         if self._visible:
             self._refresh_state()
         self._dirty_all()
-
-    def close(self):
-        if not self._visible:
+        if not notify:
             return
-        self._visible = False
-        self._dirty_all()
+        callback = self._on_visibility_changed
+        if callable(callback):
+            try:
+                callback()
+            except Exception:
+                pass
 
     def _state_key(self):
         return (

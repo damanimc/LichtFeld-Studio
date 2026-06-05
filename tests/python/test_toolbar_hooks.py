@@ -1063,6 +1063,55 @@ def test_viewport_export_toolbar_action_shows_overlay_immediately(toolbar_module
     assert redraw_calls
 
 
+def test_viewport_export_close_action_hides_overlay_immediately(toolbar_module, monkeypatch):
+    module, _hook_calls, _remove_calls = toolbar_module
+    model = _DataModelStub()
+    doc = _DocumentStub()
+    lf_stub = sys.modules["lichtfeld"]
+    redraw_calls = []
+
+    lf_stub.RenderMode = SimpleNamespace(
+        SPLATS="splats",
+        POINTS="points",
+        RINGS="rings",
+        CENTERS="centers",
+    )
+    lf_stub.get_camera_navigation_mode = lambda: "orbit"
+    lf_stub.get_camera_view_snap_enabled = lambda: False
+    lf_stub.get_render_mode = lambda: lf_stub.RenderMode.SPLATS
+    lf_stub.is_fullscreen = lambda: False
+    lf_stub.is_orthographic = lambda: False
+    lf_stub.get_depth_view = lambda: False
+    lf_stub.get_selected_node_names = lambda: []
+    monkeypatch.setattr(lf_stub.ui, "context", lambda: SimpleNamespace(has_scene=True), raising=False)
+    monkeypatch.setattr(lf_stub.ui, "get_active_tool", lambda: "", raising=False)
+    monkeypatch.setattr(lf_stub.ui, "get_transform_space", lambda: 1, raising=False)
+    monkeypatch.setattr(lf_stub.ui, "get_pivot_mode", lambda: 0, raising=False)
+    monkeypatch.setattr(lf_stub.ui, "get_split_view_mode", lambda: "single", raising=False)
+    monkeypatch.setattr(lf_stub.ui, "is_sequencer_visible", lambda: False, raising=False)
+    monkeypatch.setattr(lf_stub.ui, "is_panel_enabled", lambda _panel_id: False, raising=False)
+    monkeypatch.setattr(lf_stub.ui, "request_redraw", lambda: redraw_calls.append(True), raising=False)
+    monkeypatch.setattr(module, "histogram_mode_available", lambda _context: False)
+
+    module.reset_overlay_state()
+    module.bind_overlay_model(model)
+    module.attach_overlay_model_handle(model.handle)
+    module._toolbar_controller._current_doc = doc
+
+    model.bound_events["toolbar_action"](None, None, ["toggle_viewport_export", ""])
+    assert "hidden" not in doc.elements["viewport-export-block"].classes
+
+    redraw_calls.clear()
+    model.handle.record_updates.clear()
+    model.bound_events["viewport_export_action"](None, None, ["close"])
+
+    assert "hidden" in doc.elements["viewport-export-block"].classes
+    extra_buttons = model.handle.record_updates["utility_extra_buttons"]
+    extra_by_id = {button["button_id"]: button for button in extra_buttons}
+    assert extra_by_id["util-viewport-export"]["selected"] is False
+    assert redraw_calls
+
+
 def test_viewport_export_status_animates_then_hides(toolbar_module, monkeypatch):
     module, _hook_calls, _remove_calls = toolbar_module
     export_module = sys.modules["lfs_plugins.viewport_export_controls"]
