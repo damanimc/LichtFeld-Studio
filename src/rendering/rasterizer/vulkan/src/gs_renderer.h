@@ -176,7 +176,8 @@ protected:
                                         const _VulkanBuffer& preview_mask,
                                         const _VulkanBuffer& selection_colors,
                                         const _VulkanBuffer& overlay_flags,
-                                        const _VulkanBuffer& overlay_params);
+                                        const _VulkanBuffer& overlay_params,
+                                        bool overlays_active);
 
     _ComputePipeline pipeline_projection_forward = _ComputePipeline(19);
     _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(19);
@@ -197,10 +198,13 @@ protected:
     _ComputePipelinePair pipeline_rasterize_forward_3dgut = _ComputePipelinePair(20);
     _ComputePipelinePair pipeline_rasterize_forward_plain = _ComputePipelinePair(14);
     _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain = _ComputePipelinePair(20);
+    _ComputePipelinePair pipeline_rasterize_forward_light = _ComputePipelinePair(14);
     _ComputePipelinePair pipeline_rasterize_forward_light_plain = _ComputePipelinePair(14);
     _ComputePipeline pipeline_tile_batch_counts = _ComputePipeline(2);
     _ComputePipeline pipeline_tile_batch_descriptors = _ComputePipeline(4);
+    _ComputePipelinePair pipeline_rasterize_forward_batches = _ComputePipelinePair(12);
     _ComputePipelinePair pipeline_rasterize_forward_batches_plain = _ComputePipelinePair(7);
+    _ComputePipeline pipeline_compose_tile_batches = _ComputePipeline(17);
     _ComputePipeline pipeline_compose_tile_batches_plain = _ComputePipeline(12);
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);

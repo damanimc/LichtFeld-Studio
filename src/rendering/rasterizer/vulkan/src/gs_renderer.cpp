@@ -222,13 +222,18 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
         createComputePipeline(pipeline_rasterize_forward_3dgut[i], spirv_paths.at("rasterize_forward_3dgut"));
         createComputePipeline(pipeline_rasterize_forward_plain[i], spirv_paths.at("rasterize_forward_plain"));
         createComputePipeline(pipeline_rasterize_forward_3dgut_plain[i], spirv_paths.at("rasterize_forward_3dgut_plain"));
+        createComputePipeline(pipeline_rasterize_forward_light[i],
+                              spirv_paths.at("rasterize_forward_light"));
         createComputePipeline(pipeline_rasterize_forward_light_plain[i],
                               spirv_paths.at("rasterize_forward_light_plain"));
+        createComputePipeline(pipeline_rasterize_forward_batches[i],
+                              spirv_paths.at("rasterize_forward_batches"));
         createComputePipeline(pipeline_rasterize_forward_batches_plain[i],
                               spirv_paths.at("rasterize_forward_batches_plain"));
     }
     createComputePipeline(pipeline_tile_batch_counts, spirv_paths.at("tile_batch_counts"));
     createComputePipeline(pipeline_tile_batch_descriptors, spirv_paths.at("tile_batch_descriptors"));
+    createComputePipeline(pipeline_compose_tile_batches, spirv_paths.at("compose_tile_batches"));
     createComputePipeline(pipeline_compose_tile_batches_plain, spirv_paths.at("compose_tile_batches_plain"));
     createComputePipeline(pipeline_cumsum.single_pass, spirv_paths.at("cumsum_single_pass"));
     createComputePipeline(pipeline_cumsum.block_scan, spirv_paths.at("cumsum_block_scan"));
@@ -400,7 +405,8 @@ void VulkanGSRenderer::executeBatchedRasterizeForward(
     const _VulkanBuffer& preview_mask,
     const _VulkanBuffer& selection_colors,
     const _VulkanBuffer& overlay_flags,
-    const _VulkanBuffer& overlay_params) {
+    const _VulkanBuffer& overlay_params,
+    const bool overlays_active) {
     const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
     const size_t num_pixels = static_cast<size_t>(uniforms.image_height) * uniforms.image_width;
     const size_t batch_capacity = denseTileBatchCapacity(buffers.num_indices, num_tiles);
@@ -446,10 +452,13 @@ void VulkanGSRenderer::executeBatchedRasterizeForward(
     auto& pixel_depth = resizeDeviceBuffer(buffers.pixel_depth, num_pixels);
     auto& n_contributors = resizeDeviceBuffer(buffers.n_contributors, num_pixels);
 
+    auto& light_pipeline = overlays_active
+                               ? pipeline_rasterize_forward_light
+                               : pipeline_rasterize_forward_light_plain;
     executeCompute(
         {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
         &uniforms, sizeof(uniforms),
-        pipeline_rasterize_forward_light_plain[buffers.is_unsorted_1],
+        light_pipeline[buffers.is_unsorted_1],
         {
             buffers.sorted_gauss_idx().deviceBuffer,
             buffers.tile_ranges.deviceBuffer,
@@ -481,44 +490,69 @@ void VulkanGSRenderer::executeBatchedRasterizeForward(
                             {tile_batch_dispatch_args, COMPUTE_SHADER_WRITE},
                         },
                         INDIRECT_DISPATCH_READ);
+    std::vector<_VulkanBuffer> batch_bindings{
+        buffers.sorted_gauss_idx().deviceBuffer,
+        tile_batch_descriptors,
+        buffers.xy_vs.deviceBuffer,
+        buffers.inv_cov_vs_opacity.deviceBuffer,
+        buffers.rgb.deviceBuffer,
+        tile_batch_pixel_state,
+        tile_batch_n_contributors,
+    };
+    if (overlays_active) {
+        batch_bindings.insert(batch_bindings.end(),
+                              {
+                                  selection_mask,
+                                  preview_mask,
+                                  selection_colors,
+                                  overlay_flags,
+                                  overlay_params,
+                              });
+    }
+    auto& batch_pipeline = overlays_active
+                               ? pipeline_rasterize_forward_batches
+                               : pipeline_rasterize_forward_batches_plain;
     executeComputeIndirect(
         tile_batch_dispatch_args,
         0,
         &uniforms, sizeof(uniforms),
-        pipeline_rasterize_forward_batches_plain[buffers.is_unsorted_1],
-        {
-            buffers.sorted_gauss_idx().deviceBuffer,
-            tile_batch_descriptors,
-            buffers.xy_vs.deviceBuffer,
-            buffers.inv_cov_vs_opacity.deviceBuffer,
-            buffers.rgb.deviceBuffer,
-            tile_batch_pixel_state,
-            tile_batch_n_contributors,
-        });
+        batch_pipeline[buffers.is_unsorted_1],
+        batch_bindings);
 
     bufferMemoryBarrier({
                             {tile_batch_pixel_state, COMPUTE_SHADER_WRITE},
                             {tile_batch_n_contributors, COMPUTE_SHADER_WRITE},
                         },
                         COMPUTE_SHADER_READ);
+    std::vector<_VulkanBuffer> compose_bindings{
+        buffers.sorted_gauss_idx().deviceBuffer,
+        tile_batch_descriptors,
+        tile_batch_offsets,
+        buffers.xy_vs.deviceBuffer,
+        buffers.inv_cov_vs_opacity.deviceBuffer,
+        buffers.rgb.deviceBuffer,
+        buffers.depths.deviceBuffer,
+        tile_batch_pixel_state,
+        tile_batch_n_contributors,
+        pixel_state,
+        pixel_depth,
+        n_contributors,
+    };
+    if (overlays_active) {
+        compose_bindings.insert(compose_bindings.end(),
+                                {
+                                    selection_mask,
+                                    preview_mask,
+                                    selection_colors,
+                                    overlay_flags,
+                                    overlay_params,
+                                });
+    }
     executeCompute(
         {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
         &uniforms, sizeof(uniforms),
-        pipeline_compose_tile_batches_plain,
-        {
-            buffers.sorted_gauss_idx().deviceBuffer,
-            tile_batch_descriptors,
-            tile_batch_offsets,
-            buffers.xy_vs.deviceBuffer,
-            buffers.inv_cov_vs_opacity.deviceBuffer,
-            buffers.rgb.deviceBuffer,
-            buffers.depths.deviceBuffer,
-            tile_batch_pixel_state,
-            tile_batch_n_contributors,
-            pixel_state,
-            pixel_depth,
-            n_contributors,
-        });
+        overlays_active ? pipeline_compose_tile_batches : pipeline_compose_tile_batches_plain,
+        compose_bindings);
 }
 
 void VulkanGSRenderer::executeRasterizeForward(
@@ -563,7 +597,6 @@ void VulkanGSRenderer::executeRasterizeForward(
     const size_t num_tiles = static_cast<size_t>(uniforms.grid_height) * uniforms.grid_width;
     const bool use_batched_raster =
         !use_gut_rasterization &&
-        !overlays_active &&
         num_tiles > 0 &&
         buffers.num_indices >= kMinLoadBalancedRasterInstances &&
         buffers.num_indices / num_tiles >= kMinLoadBalancedAverageTileInstances;
@@ -574,7 +607,8 @@ void VulkanGSRenderer::executeRasterizeForward(
                                        preview_mask,
                                        selection_colors,
                                        overlay_flags,
-                                       overlay_params);
+                                       overlay_params,
+                                       overlays_active);
         return;
     }
 
