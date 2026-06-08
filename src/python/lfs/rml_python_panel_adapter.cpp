@@ -589,6 +589,14 @@ namespace lfs::vis::gui {
         if (!host_)
             return false;
 
+        if (!dirty_driven_updates_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (next_update_at_ == std::chrono::steady_clock::time_point{} ||
+                now >= next_update_at_) {
+                return true;
+            }
+        }
+
         const auto& ops = lfs::python::get_rml_panel_host_ops();
         if (ops.get_document) {
             auto* doc = static_cast<Rml::ElementDocument*>(ops.get_document(host_));
