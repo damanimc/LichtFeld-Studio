@@ -743,7 +743,19 @@ namespace lfs::vis::gui {
             if (is_text_target) {
                 wants_input_ = true;
                 guiFocusState().want_capture_keyboard = true;
+                // Numpad digit and period scancodes must be suppressed from
+                // ProcessKeyDown / ProcessKeyUp when a text input is focused,
+                // otherwise RmlUi treats them as navigation keys (Home, End,
+                // arrows, etc.). The actual digit text arrives via
+                // ProcessTextInput below. This mirrors the fix in
+                // rml_panel_host.cpp for the sidebar text inputs.
+                auto isNumpadTextKey = [](int sc) {
+                    return (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) ||
+                           sc == SDL_SCANCODE_KP_PERIOD;
+                };
                 for (const int sc : input.keys_pressed) {
+                    if (isNumpadTextKey(sc))
+                        continue;
                     const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
                     if (rml_key != Rml::Input::KI_UNKNOWN) {
                         markRenderNeeded(RenderReason::Keyboard);
@@ -751,6 +763,8 @@ namespace lfs::vis::gui {
                     }
                 }
                 for (const int sc : input.keys_released) {
+                    if (isNumpadTextKey(sc))
+                        continue;
                     const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
                     if (rml_key != Rml::Input::KI_UNKNOWN) {
                         markRenderNeeded(RenderReason::Keyboard);
