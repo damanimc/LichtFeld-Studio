@@ -29,6 +29,7 @@
     },
     "implot",
     "libarchive",
+    "libdeflate",
     "libwebp",
     "nanobind",
     {

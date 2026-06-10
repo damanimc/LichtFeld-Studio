@@ -15,6 +15,8 @@
 #include <cuda_runtime.h>
 #include <expected>
 #include <format>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include <vector>
 
 namespace {
@@ -687,17 +689,21 @@ namespace lfs::core {
         const size_t src_floats = shN_cpu.numel();
         const size_t active_floats = k * SH_CHANNELS;
 
-        for (size_t p = 0; p < n; ++p) {
-            float* const dst_row = dst + p * active_floats;
-            for (size_t offset = 0; offset < active_floats; ++offset) {
-                const auto slot = static_cast<std::uint32_t>(offset / 4u);
-                const auto component = static_cast<std::uint32_t>(offset % 4u);
-                const size_t src_offset =
-                    static_cast<size_t>(sh_swizzled_index(static_cast<std::uint32_t>(p), slot, static_cast<uint32_t>(k))) * 4u +
-                    component;
-                dst_row[offset] = src_offset < src_floats ? src[src_offset] : 0.0f;
-            }
-        }
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, n),
+            [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t p = range.begin(); p != range.end(); ++p) {
+                    float* const dst_row = dst + p * active_floats;
+                    for (size_t offset = 0; offset < active_floats; ++offset) {
+                        const auto slot = static_cast<std::uint32_t>(offset / 4u);
+                        const auto component = static_cast<std::uint32_t>(offset % 4u);
+                        const size_t src_offset =
+                            static_cast<size_t>(sh_swizzled_index(static_cast<std::uint32_t>(p), slot, static_cast<uint32_t>(k))) * 4u +
+                            component;
+                        dst_row[offset] = src_offset < src_floats ? src[src_offset] : 0.0f;
+                    }
+                }
+            });
 
         return out;
     }

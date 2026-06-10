@@ -12,6 +12,7 @@
 #include "io/error.hpp"
 
 #include <cuda_runtime.h>
+#include <libdeflate.h>
 #include <nlohmann/json.hpp>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -266,9 +268,51 @@ namespace lfs::io {
         // RAD Compression/Decompression
         // ============================================================================
 
+        struct TlsDeflateCompressor {
+            libdeflate_compressor* handle = nullptr;
+            int level = -1;
+
+            ~TlsDeflateCompressor() {
+                if (handle != nullptr) {
+                    libdeflate_free_compressor(handle);
+                }
+            }
+
+            libdeflate_compressor* get(int requested_level) {
+                if (handle == nullptr || level != requested_level) {
+                    if (handle != nullptr) {
+                        libdeflate_free_compressor(handle);
+                    }
+                    handle = libdeflate_alloc_compressor(requested_level);
+                    level = requested_level;
+                }
+                return handle;
+            }
+        };
+
+        struct TlsDeflateDecompressor {
+            libdeflate_decompressor* handle = nullptr;
+
+            ~TlsDeflateDecompressor() {
+                if (handle != nullptr) {
+                    libdeflate_free_decompressor(handle);
+                }
+            }
+
+            libdeflate_decompressor* get() {
+                if (handle == nullptr) {
+                    handle = libdeflate_alloc_decompressor();
+                }
+                return handle;
+            }
+        };
+
+        thread_local TlsDeflateCompressor tls_compressor;
+        thread_local TlsDeflateDecompressor tls_decompressor;
+
         // Reference RAD writers mark compression as "gz" but emit raw DEFLATE streams
         // (without gzip/zlib wrapper bytes).
-        std::vector<uint8_t> rad_compress(const uint8_t* data, size_t size, int level = GZ_LEVEL) {
+        std::vector<uint8_t> rad_compress_zlib(const uint8_t* data, size_t size, int level = GZ_LEVEL) {
             if (size == 0) {
                 return {};
             }
@@ -316,6 +360,26 @@ namespace lfs::io {
                 return {};
             }
 
+            return output;
+        }
+
+        std::vector<uint8_t> rad_compress(const uint8_t* data, size_t size, int level = GZ_LEVEL) {
+            if (size == 0) {
+                return {};
+            }
+
+            const int effective_level = std::clamp(level == Z_DEFAULT_COMPRESSION ? GZ_LEVEL : level, 0, 9);
+            libdeflate_compressor* compressor = tls_compressor.get(effective_level);
+            if (compressor == nullptr) {
+                return rad_compress_zlib(data, size, level);
+            }
+
+            std::vector<uint8_t> output(libdeflate_deflate_compress_bound(compressor, size));
+            const size_t written = libdeflate_deflate_compress(compressor, data, size, output.data(), output.size());
+            if (written == 0) {
+                return rad_compress_zlib(data, size, level);
+            }
+            output.resize(written);
             return output;
         }
 
@@ -375,6 +439,70 @@ namespace lfs::io {
                 return std::move(*zlib);
             }
             return {};
+        }
+
+        // Fast one-shot decompression when the decoded size is known from the
+        // property layout. Falls back to streaming zlib for size mismatches and
+        // wrapped/legacy streams.
+        std::vector<uint8_t> rad_decompress_sized(const uint8_t* data, size_t size, size_t expected_bytes) {
+            if (expected_bytes > 0 && size > 0) {
+                if (libdeflate_decompressor* decompressor = tls_decompressor.get()) {
+                    std::vector<uint8_t> output(expected_bytes);
+                    size_t actual = 0;
+                    if (libdeflate_deflate_decompress(decompressor, data, size,
+                                                      output.data(), output.size(), &actual) == LIBDEFLATE_SUCCESS &&
+                        actual == expected_bytes) {
+                        return output;
+                    }
+                    if (libdeflate_gzip_decompress(decompressor, data, size,
+                                                   output.data(), output.size(), &actual) == LIBDEFLATE_SUCCESS &&
+                        actual == expected_bytes) {
+                        return output;
+                    }
+                    if (libdeflate_zlib_decompress(decompressor, data, size,
+                                                   output.data(), output.size(), &actual) == LIBDEFLATE_SUCCESS &&
+                        actual == expected_bytes) {
+                        return output;
+                    }
+                }
+            }
+            return rad_decompress(data, size);
+        }
+
+        // Decoded byte count implied by a property's name + encoding, or 0 when unknown.
+        size_t rad_property_decoded_bytes(const std::string& property, const std::string& encoding, size_t count) {
+            size_t dims = 0;
+            if (property == PROP_CENTER || property == PROP_RGB || property == PROP_SCALES) {
+                dims = 3;
+            } else if (property == PROP_ALPHA || property == PROP_CHILD_COUNT || property == PROP_CHILD_START) {
+                dims = 1;
+            } else if (property == PROP_ORIENTATION) {
+                return encoding == "oct88r8" ? count * 3 : count * 3 * (encoding == "f16" ? 2 : 4);
+            } else if (property == PROP_SH1) {
+                dims = 9;
+            } else if (property == PROP_SH2) {
+                dims = 15;
+            } else if (property == PROP_SH3) {
+                dims = 21;
+            } else if (property.find(PROP_CENTER) == 0 || property.find(PROP_RGB) == 0 ||
+                       property.find(PROP_SCALES) == 0 || property.find("sh") == 0) {
+                dims = 1;
+            } else {
+                return 0;
+            }
+
+            size_t element_bytes = 0;
+            if (encoding == "f32" || encoding == "f32_lebytes" || encoding == "u32") {
+                element_bytes = 4;
+            } else if (encoding == "f16" || encoding == "f16_lebytes" || encoding == "ln_f16" || encoding == "u16") {
+                element_bytes = 2;
+            } else if (encoding == "r8" || encoding == "r8_delta" || encoding == "s8" ||
+                       encoding == "s8_delta" || encoding == "ln_0r8") {
+                element_bytes = 1;
+            } else {
+                return 0;
+            }
+            return count * dims * element_bytes;
         }
 
         // ============================================================================
@@ -1537,6 +1665,204 @@ namespace lfs::io {
             }
         };
 
+        // Decode one chunk's properties into caller-provided buffers holding
+        // display-space values. Offsets are absolute positions in `data`;
+        // `chunk_origin` anchors legacy chunk-relative property offsets.
+        std::optional<std::string> decode_chunk_properties(
+            const uint8_t* data,
+            const RadChunkMeta& chunk,
+            const size_t chunk_origin,
+            const size_t payload_start,
+            const bool has_payload_prefix,
+            const size_t chunk_end,
+            const int sh_coeffs,
+            float* const means,
+            float* const opacity,
+            float* const sh0,
+            float* const scales,
+            float* const rotation,
+            float* const shN,
+            uint16_t* const child_count,
+            uint32_t* const child_start) {
+            const std::size_t chunk_count = static_cast<std::size_t>(chunk.count);
+            std::vector<float> comp_data(chunk_count);
+
+            try {
+                for (const auto& prop : chunk.properties) {
+                    const std::size_t prop_offset = static_cast<std::size_t>(prop.offset);
+                    const std::size_t prop_bytes = static_cast<std::size_t>(prop.bytes);
+                    const std::size_t absolute_offset =
+                        has_payload_prefix ? (payload_start + prop_offset) : (chunk_origin + prop_offset);
+                    if (absolute_offset + prop_bytes > chunk_end) {
+                        return "RAD chunk property data exceeds file bounds";
+                    }
+
+                    std::vector<uint8_t> prop_data;
+                    if (prop.compression.has_value() &&
+                        (prop.compression.value() == "gz" || prop.compression.value() == "gzip")) {
+                        const size_t decoded_bytes = rad_property_decoded_bytes(prop.property, prop.encoding, chunk_count);
+                        prop_data = rad_decompress_sized(&data[absolute_offset], prop_bytes, decoded_bytes);
+                        if (prop_data.empty()) {
+                            return "Failed to decompress RAD chunk property: " + prop.property;
+                        }
+                    } else {
+                        prop_data.assign(&data[absolute_offset], &data[absolute_offset + prop_bytes]);
+                    }
+
+                    if (prop.property == PROP_CENTER) {
+                        PropertyDecoder::decode_center(prop_data.data(), means, 3, chunk_count, prop.encoding);
+                    } else if (prop.property.find(PROP_CENTER) == 0 && prop.property != PROP_CENTER) {
+                        const int comp = prop.property.back() - '0';
+                        PropertyDecoder::decode_center(prop_data.data(), comp_data.data(), 1, chunk_count, prop.encoding);
+                        for (std::size_t i = 0; i < chunk_count; ++i) {
+                            means[i * 3u + static_cast<std::size_t>(comp)] = comp_data[i];
+                        }
+                    } else if (prop.property == PROP_ALPHA) {
+                        PropertyDecoder::decode_alpha(prop_data.data(),
+                                                      opacity,
+                                                      chunk_count,
+                                                      prop.encoding,
+                                                      prop.min_val.value_or(0.0f),
+                                                      prop.max_val.value_or(1.0f));
+                    } else if (prop.property == PROP_RGB) {
+                        PropertyDecoder::decode_rgb(prop_data.data(),
+                                                    sh0,
+                                                    3,
+                                                    chunk_count,
+                                                    prop.encoding,
+                                                    prop.min_val.value_or(0.0f),
+                                                    prop.max_val.value_or(1.0f),
+                                                    prop.base.value_or(0.0f),
+                                                    prop.scale.value_or(1.0f));
+                    } else if (prop.property.find(PROP_RGB) == 0 && prop.property != PROP_RGB) {
+                        const int comp = prop.property.back() - '0';
+                        PropertyDecoder::decode_rgb(prop_data.data(),
+                                                    comp_data.data(),
+                                                    1,
+                                                    chunk_count,
+                                                    prop.encoding,
+                                                    prop.min_val.value_or(0.0f),
+                                                    prop.max_val.value_or(1.0f),
+                                                    prop.base.value_or(0.0f),
+                                                    prop.scale.value_or(1.0f));
+                        for (std::size_t i = 0; i < chunk_count; ++i) {
+                            sh0[i * 3u + static_cast<std::size_t>(comp)] = comp_data[i];
+                        }
+                    } else if (prop.property == PROP_SCALES) {
+                        PropertyDecoder::decode_scales(prop_data.data(),
+                                                       scales,
+                                                       3,
+                                                       chunk_count,
+                                                       prop.encoding,
+                                                       prop.min_val.value_or(0.0f),
+                                                       prop.max_val.value_or(prop.scale.value_or(1.0f)));
+                    } else if (prop.property.find(PROP_SCALES) == 0 && prop.property != PROP_SCALES) {
+                        const int comp = prop.property.back() - '0';
+                        PropertyDecoder::decode_scales(prop_data.data(),
+                                                       comp_data.data(),
+                                                       1,
+                                                       chunk_count,
+                                                       prop.encoding,
+                                                       prop.min_val.value_or(0.0f),
+                                                       prop.max_val.value_or(prop.scale.value_or(1.0f)));
+                        for (std::size_t i = 0; i < chunk_count; ++i) {
+                            scales[i * 3u + static_cast<std::size_t>(comp)] = comp_data[i];
+                        }
+                    } else if (prop.property == PROP_ORIENTATION) {
+                        std::vector<float> quat_data(chunk_count * 4u);
+                        PropertyDecoder::decode_orientation(prop_data.data(), quat_data.data(), chunk_count, prop.encoding);
+                        for (std::size_t i = 0; i < chunk_count; ++i) {
+                            rotation[i * 4u + 0u] = quat_data[i * 4u + 3u];
+                            rotation[i * 4u + 1u] = quat_data[i * 4u + 0u];
+                            rotation[i * 4u + 2u] = quat_data[i * 4u + 1u];
+                            rotation[i * 4u + 3u] = quat_data[i * 4u + 2u];
+                        }
+                    } else if ((prop.property == PROP_SH1 || prop.property == PROP_SH2 || prop.property == PROP_SH3) &&
+                               sh_coeffs > 0 && shN != nullptr) {
+                        int coeff_start = 0;
+                        int coeff_count = 0;
+                        if (prop.property == PROP_SH1) {
+                            coeff_start = 0;
+                            coeff_count = 3;
+                        } else if (prop.property == PROP_SH2) {
+                            coeff_start = 3;
+                            coeff_count = 5;
+                        } else {
+                            coeff_start = 8;
+                            coeff_count = 7;
+                        }
+
+                        const std::size_t dims = static_cast<std::size_t>(coeff_count) * 3u;
+                        std::vector<float> sh_block(chunk_count * dims, 0.0f);
+                        PropertyDecoder::decode_sh(prop_data.data(),
+                                                   sh_block.data(),
+                                                   dims,
+                                                   chunk_count,
+                                                   prop.encoding,
+                                                   prop.min_val.value_or(0.0f),
+                                                   prop.max_val.value_or(1.0f),
+                                                   prop.base.value_or(0.0f),
+                                                   prop.scale.value_or(1.0f));
+
+                        for (std::size_t i = 0; i < chunk_count; ++i) {
+                            for (int c = 0; c < coeff_count; ++c) {
+                                const int coeff = coeff_start + c;
+                                if (coeff >= sh_coeffs) {
+                                    continue;
+                                }
+                                for (int ch = 0; ch < 3; ++ch) {
+                                    shN[i * static_cast<std::size_t>(sh_coeffs) * 3u +
+                                        static_cast<std::size_t>(coeff) * 3u +
+                                        static_cast<std::size_t>(ch)] =
+                                        sh_block[i * dims + static_cast<std::size_t>(c) * 3u +
+                                                 static_cast<std::size_t>(ch)];
+                                }
+                            }
+                        }
+                    } else if (prop.property.find("sh") == 0 && sh_coeffs > 0 && shN != nullptr) {
+                        const std::size_t first_underscore = prop.property.find('_');
+                        const std::size_t second_underscore = prop.property.find('_', first_underscore + 1);
+                        if (first_underscore != std::string::npos && second_underscore != std::string::npos) {
+                            const int coeff = std::stoi(prop.property.substr(first_underscore + 1,
+                                                                             second_underscore - first_underscore - 1));
+                            const int ch = prop.property.back() - '0';
+                            if (coeff >= 0 && coeff < sh_coeffs && ch >= 0 && ch < 3) {
+                                PropertyDecoder::decode_sh(prop_data.data(),
+                                                           comp_data.data(),
+                                                           1,
+                                                           chunk_count,
+                                                           prop.encoding,
+                                                           prop.min_val.value_or(0.0f),
+                                                           prop.max_val.value_or(1.0f),
+                                                           prop.base.value_or(0.0f),
+                                                           prop.scale.value_or(1.0f));
+                                for (std::size_t i = 0; i < chunk_count; ++i) {
+                                    shN[i * static_cast<std::size_t>(sh_coeffs) * 3u +
+                                        static_cast<std::size_t>(coeff) * 3u +
+                                        static_cast<std::size_t>(ch)] = comp_data[i];
+                                }
+                            }
+                        }
+                    } else if (prop.property == PROP_CHILD_COUNT && child_count != nullptr) {
+                        if (prop_data.size() >= chunk_count * 2u) {
+                            for (std::size_t i = 0; i < chunk_count; ++i) {
+                                child_count[i] = decode_u16(&prop_data[i * 2u]);
+                            }
+                        }
+                    } else if (prop.property == PROP_CHILD_START && child_start != nullptr) {
+                        if (prop_data.size() >= chunk_count * 4u) {
+                            for (std::size_t i = 0; i < chunk_count; ++i) {
+                                child_start[i] = decode_u32(&prop_data[i * 4u]);
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                return std::string("Failed to decode RAD chunk: ") + e.what();
+            }
+            return std::nullopt;
+        }
+
         std::expected<RadDecodedChunk, std::string> decode_rad_chunk_buffer(
             const std::vector<uint8_t>& data,
             int fallback_max_sh,
@@ -1614,179 +1940,23 @@ namespace lfs::io {
                 chunk_child_start.resize(chunk_count);
             }
 
-            std::vector<float> comp_data(chunk_count);
-
-            try {
-                for (const auto& prop : chunk.properties) {
-                    const std::size_t prop_offset = static_cast<std::size_t>(prop.offset);
-                    const std::size_t prop_bytes = static_cast<std::size_t>(prop.bytes);
-                    const std::size_t absolute_offset =
-                        has_payload_prefix ? (payload_start + prop_offset) : (offset + prop_offset);
-                    if (absolute_offset + prop_bytes > chunk_end) {
-                        return std::unexpected("RAD chunk property data exceeds file bounds");
-                    }
-
-                    std::vector<uint8_t> prop_data;
-                    if (prop.compression.has_value() &&
-                        (prop.compression.value() == "gz" || prop.compression.value() == "gzip")) {
-                        prop_data = rad_decompress(&data[absolute_offset], prop_bytes);
-                        if (prop_data.empty()) {
-                            return std::unexpected("Failed to decompress RAD chunk property: " + prop.property);
-                        }
-                    } else {
-                        prop_data.assign(&data[absolute_offset], &data[absolute_offset + prop_bytes]);
-                    }
-
-                    if (prop.property == PROP_CENTER) {
-                        PropertyDecoder::decode_center(prop_data.data(), chunk_means.data(), 3, chunk_count, prop.encoding);
-                    } else if (prop.property.find(PROP_CENTER) == 0 && prop.property != PROP_CENTER) {
-                        const int comp = prop.property.back() - '0';
-                        PropertyDecoder::decode_center(prop_data.data(), comp_data.data(), 1, chunk_count, prop.encoding);
-                        for (std::size_t i = 0; i < chunk_count; ++i) {
-                            chunk_means[i * 3u + static_cast<std::size_t>(comp)] = comp_data[i];
-                        }
-                    } else if (prop.property == PROP_ALPHA) {
-                        PropertyDecoder::decode_alpha(prop_data.data(),
-                                                      chunk_opacity.data(),
-                                                      chunk_count,
-                                                      prop.encoding,
-                                                      prop.min_val.value_or(0.0f),
-                                                      prop.max_val.value_or(1.0f));
-                    } else if (prop.property == PROP_RGB) {
-                        PropertyDecoder::decode_rgb(prop_data.data(),
-                                                    chunk_sh0.data(),
-                                                    3,
-                                                    chunk_count,
-                                                    prop.encoding,
-                                                    prop.min_val.value_or(0.0f),
-                                                    prop.max_val.value_or(1.0f),
-                                                    prop.base.value_or(0.0f),
-                                                    prop.scale.value_or(1.0f));
-                    } else if (prop.property.find(PROP_RGB) == 0 && prop.property != PROP_RGB) {
-                        const int comp = prop.property.back() - '0';
-                        PropertyDecoder::decode_rgb(prop_data.data(),
-                                                    comp_data.data(),
-                                                    1,
-                                                    chunk_count,
-                                                    prop.encoding,
-                                                    prop.min_val.value_or(0.0f),
-                                                    prop.max_val.value_or(1.0f),
-                                                    prop.base.value_or(0.0f),
-                                                    prop.scale.value_or(1.0f));
-                        for (std::size_t i = 0; i < chunk_count; ++i) {
-                            chunk_sh0[i * 3u + static_cast<std::size_t>(comp)] = comp_data[i];
-                        }
-                    } else if (prop.property == PROP_SCALES) {
-                        PropertyDecoder::decode_scales(prop_data.data(),
-                                                       chunk_scales.data(),
-                                                       3,
-                                                       chunk_count,
-                                                       prop.encoding,
-                                                       prop.min_val.value_or(0.0f),
-                                                       prop.max_val.value_or(prop.scale.value_or(1.0f)));
-                    } else if (prop.property.find(PROP_SCALES) == 0 && prop.property != PROP_SCALES) {
-                        const int comp = prop.property.back() - '0';
-                        PropertyDecoder::decode_scales(prop_data.data(),
-                                                       comp_data.data(),
-                                                       1,
-                                                       chunk_count,
-                                                       prop.encoding,
-                                                       prop.min_val.value_or(0.0f),
-                                                       prop.max_val.value_or(prop.scale.value_or(1.0f)));
-                        for (std::size_t i = 0; i < chunk_count; ++i) {
-                            chunk_scales[i * 3u + static_cast<std::size_t>(comp)] = comp_data[i];
-                        }
-                    } else if (prop.property == PROP_ORIENTATION) {
-                        std::vector<float> quat_data(chunk_count * 4u);
-                        PropertyDecoder::decode_orientation(prop_data.data(), quat_data.data(), chunk_count, prop.encoding);
-                        for (std::size_t i = 0; i < chunk_count; ++i) {
-                            chunk_rotation[i * 4u + 0u] = quat_data[i * 4u + 3u];
-                            chunk_rotation[i * 4u + 1u] = quat_data[i * 4u + 0u];
-                            chunk_rotation[i * 4u + 2u] = quat_data[i * 4u + 1u];
-                            chunk_rotation[i * 4u + 3u] = quat_data[i * 4u + 2u];
-                        }
-                    } else if ((prop.property == PROP_SH1 || prop.property == PROP_SH2 || prop.property == PROP_SH3) &&
-                               sh_coeffs > 0) {
-                        int coeff_start = 0;
-                        int coeff_count = 0;
-                        if (prop.property == PROP_SH1) {
-                            coeff_start = 0;
-                            coeff_count = 3;
-                        } else if (prop.property == PROP_SH2) {
-                            coeff_start = 3;
-                            coeff_count = 5;
-                        } else {
-                            coeff_start = 8;
-                            coeff_count = 7;
-                        }
-
-                        const std::size_t dims = static_cast<std::size_t>(coeff_count) * 3u;
-                        std::vector<float> sh_block(chunk_count * dims, 0.0f);
-                        PropertyDecoder::decode_sh(prop_data.data(),
-                                                   sh_block.data(),
-                                                   dims,
-                                                   chunk_count,
-                                                   prop.encoding,
-                                                   prop.min_val.value_or(0.0f),
-                                                   prop.max_val.value_or(1.0f),
-                                                   prop.base.value_or(0.0f),
-                                                   prop.scale.value_or(1.0f));
-
-                        for (std::size_t i = 0; i < chunk_count; ++i) {
-                            for (int c = 0; c < coeff_count; ++c) {
-                                const int coeff = coeff_start + c;
-                                if (coeff >= sh_coeffs) {
-                                    continue;
-                                }
-                                for (int ch = 0; ch < 3; ++ch) {
-                                    chunk_shN[i * static_cast<std::size_t>(sh_coeffs) * 3u +
-                                              static_cast<std::size_t>(coeff) * 3u +
-                                              static_cast<std::size_t>(ch)] =
-                                        sh_block[i * dims + static_cast<std::size_t>(c) * 3u +
-                                                 static_cast<std::size_t>(ch)];
-                                }
-                            }
-                        }
-                    } else if (prop.property.find("sh") == 0 && sh_coeffs > 0) {
-                        const std::size_t first_underscore = prop.property.find('_');
-                        const std::size_t second_underscore = prop.property.find('_', first_underscore + 1);
-                        if (first_underscore != std::string::npos && second_underscore != std::string::npos) {
-                            const int coeff = std::stoi(prop.property.substr(first_underscore + 1,
-                                                                             second_underscore - first_underscore - 1));
-                            const int ch = prop.property.back() - '0';
-                            if (coeff >= 0 && coeff < sh_coeffs && ch >= 0 && ch < 3) {
-                                PropertyDecoder::decode_sh(prop_data.data(),
-                                                           comp_data.data(),
-                                                           1,
-                                                           chunk_count,
-                                                           prop.encoding,
-                                                           prop.min_val.value_or(0.0f),
-                                                           prop.max_val.value_or(1.0f),
-                                                           prop.base.value_or(0.0f),
-                                                           prop.scale.value_or(1.0f));
-                                for (std::size_t i = 0; i < chunk_count; ++i) {
-                                    chunk_shN[i * static_cast<std::size_t>(sh_coeffs) * 3u +
-                                              static_cast<std::size_t>(coeff) * 3u +
-                                              static_cast<std::size_t>(ch)] = comp_data[i];
-                                }
-                            }
-                        }
-                    } else if (prop.property == PROP_CHILD_COUNT && decode_tree) {
-                        if (prop_data.size() >= chunk_count * 2u) {
-                            for (std::size_t i = 0; i < chunk_count; ++i) {
-                                chunk_child_count[i] = decode_u16(&prop_data[i * 2u]);
-                            }
-                        }
-                    } else if (prop.property == PROP_CHILD_START && decode_tree) {
-                        if (prop_data.size() >= chunk_count * 4u) {
-                            for (std::size_t i = 0; i < chunk_count; ++i) {
-                                chunk_child_start[i] = decode_u32(&prop_data[i * 4u]);
-                            }
-                        }
-                    }
-                }
-            } catch (const std::exception& e) {
-                return std::unexpected(std::string("Failed to decode RAD chunk: ") + e.what());
+            if (auto err = decode_chunk_properties(data.data(),
+                                                   chunk,
+                                                   offset,
+                                                   payload_start,
+                                                   has_payload_prefix,
+                                                   chunk_end,
+                                                   sh_coeffs,
+                                                   chunk_means.data(),
+                                                   chunk_opacity.data(),
+                                                   chunk_sh0.data(),
+                                                   chunk_scales.data(),
+                                                   chunk_rotation.data(),
+                                                   chunk_shN.empty() ? nullptr : chunk_shN.data(),
+                                                   decode_tree ? chunk_child_count.data() : nullptr,
+                                                   decode_tree ? chunk_child_start.data() : nullptr);
+                err.has_value()) {
+                return std::unexpected(std::move(*err));
             }
 
             for (float& v : chunk_sh0) {
@@ -1936,12 +2106,12 @@ namespace lfs::io {
 
                             auto chunk_result = encode_chunk(
                                 base, count, sh_degree, sh_coeffs,
-                                packed.means.data(),
-                                packed.opacity.data(),
-                                packed.sh0.data(),
-                                packed.scales.data(),
-                                packed.rotation.data(),
-                                packed.shN.empty() ? nullptr : packed.shN.data(),
+                                packed.means,
+                                packed.opacity,
+                                packed.sh0,
+                                packed.scales,
+                                packed.rotation,
+                                packed.shN,
                                 lod_tree ? packed.child_count.data() : nullptr,
                                 lod_tree ? packed.child_start.data() : nullptr,
                                 lod_tree,
@@ -2008,17 +2178,26 @@ namespace lfs::io {
             }
 
         private:
+            // Holds CPU-resident tensors (or transformed copies where the RAD
+            // domain differs) and exposes raw pointers for chunk encoding.
             struct PackedSplatData {
                 size_t count = 0;
                 int sh_degree = 0;
                 int sh_coeffs = 0;
                 bool lod_tree = false;
-                std::vector<float> means;
-                std::vector<float> opacity;
-                std::vector<float> sh0;
-                std::vector<float> scales;
-                std::vector<float> rotation;
-                std::vector<float> shN;
+                Tensor means_storage;
+                Tensor opacity_storage;
+                Tensor scales_storage;
+                Tensor shN_storage;
+                std::vector<float> means_flipped;
+                std::vector<float> sh0_display;
+                std::vector<float> rotation_normalized;
+                const float* means = nullptr;
+                const float* opacity = nullptr;
+                const float* sh0 = nullptr;
+                const float* scales = nullptr;
+                const float* rotation = nullptr;
+                const float* shN = nullptr;
                 std::vector<uint16_t> child_count;
                 std::vector<uint32_t> child_start;
             };
@@ -2028,56 +2207,89 @@ namespace lfs::io {
                 packed.count = static_cast<size_t>(splat_data.size());
                 packed.sh_degree = std::clamp(splat_data.get_max_sh_degree(), 0, 3);
                 packed.sh_coeffs = packed.sh_degree > 0 ? SH_COEFFS_FOR_DEGREE[packed.sh_degree] : 0;
+                if (packed.count == 0) {
+                    return packed;
+                }
 
-                auto copy_f32 = [](const Tensor& tensor, size_t expected_values) {
-                    std::vector<float> result;
-                    if (expected_values == 0 || !tensor.is_valid()) {
-                        return result;
-                    }
-                    const auto cpu = tensor.contiguous().to(Device::CPU);
-                    const auto* ptr = static_cast<const float*>(cpu.data_ptr());
-                    result.assign(ptr, ptr + expected_values);
-                    return result;
+                auto cpu_contiguous = [](Tensor tensor) {
+                    return tensor.contiguous().to(Device::CPU);
                 };
 
                 // Spark RAD stores render-space values, not optimizer-domain tensors.
-                packed.means = copy_f32(splat_data.get_means(), packed.count * 3);
-
-                // Apply Y-flip if requested (negate Y coordinate of positions)
+                packed.means_storage = cpu_contiguous(splat_data.get_means());
+                packed.means = packed.means_storage.ptr<float>();
                 if (flip_y) {
+                    const float* const src = packed.means;
+                    packed.means_flipped.resize(packed.count * 3);
                     tbb::parallel_for(
                         tbb::blocked_range<size_t>(0, packed.count),
                         [&](const tbb::blocked_range<size_t>& range) {
                             for (size_t i = range.begin(); i != range.end(); ++i) {
-                                packed.means[i * 3 + 1] = -packed.means[i * 3 + 1];
+                                packed.means_flipped[i * 3 + 0] = src[i * 3 + 0];
+                                packed.means_flipped[i * 3 + 1] = -src[i * 3 + 1];
+                                packed.means_flipped[i * 3 + 2] = src[i * 3 + 2];
                             }
                         });
+                    packed.means = packed.means_flipped.data();
                 }
 
                 if (splat_data.lod_tree && splat_data.lod_tree->lod_opacity_encoded) {
                     // For LOD-encoded opacity, read raw values directly (display-space, can exceed 1.0)
-                    packed.opacity = copy_f32(splat_data.opacity_raw(), packed.count);
+                    packed.opacity_storage = cpu_contiguous(splat_data.opacity_raw());
                 } else {
-                    packed.opacity = copy_f32(splat_data.get_opacity(), packed.count);
+                    packed.opacity_storage = cpu_contiguous(splat_data.get_opacity());
                 }
-                packed.sh0 = copy_f32(splat_data.sh0_raw(), packed.count * 3);
-                if (!packed.sh0.empty()) {
-                    tbb::parallel_for(
-                        tbb::blocked_range<size_t>(0, packed.sh0.size()),
-                        [&](const tbb::blocked_range<size_t>& range) {
-                            for (size_t i = range.begin(); i != range.end(); ++i) {
-                                packed.sh0[i] = 0.5f + SH_C0 * packed.sh0[i];
-                            }
-                        });
-                }
-                packed.scales = copy_f32(splat_data.get_scaling(), packed.count * 3);
-                packed.rotation = copy_f32(splat_data.get_rotation(), packed.count * 4);
+                packed.opacity = packed.opacity_storage.ptr<float>();
+
+                const Tensor sh0_cpu = cpu_contiguous(splat_data.sh0_raw());
+                const float* const sh0_src = sh0_cpu.ptr<float>();
+                packed.sh0_display.resize(packed.count * 3);
+                tbb::parallel_for(
+                    tbb::blocked_range<size_t>(0, packed.sh0_display.size()),
+                    [&](const tbb::blocked_range<size_t>& range) {
+                        for (size_t i = range.begin(); i != range.end(); ++i) {
+                            packed.sh0_display[i] = 0.5f + SH_C0 * sh0_src[i];
+                        }
+                    });
+                packed.sh0 = packed.sh0_display.data();
+
+                packed.scales_storage = cpu_contiguous(splat_data.get_scaling());
+                packed.scales = packed.scales_storage.ptr<float>();
+
+                // Normalize quaternions directly: the tensor-op chain
+                // (square/sum/sqrt/div) materializes four temporaries and
+                // dominates pack time on CPU.
+                const Tensor rotation_cpu = cpu_contiguous(splat_data.rotation_raw());
+                const float* const rot_src = rotation_cpu.ptr<float>();
+                packed.rotation_normalized.resize(packed.count * 4);
+                tbb::parallel_for(
+                    tbb::blocked_range<size_t>(0, packed.count),
+                    [&](const tbb::blocked_range<size_t>& range) {
+                        for (size_t i = range.begin(); i != range.end(); ++i) {
+                            const float x = rot_src[i * 4 + 0];
+                            const float y = rot_src[i * 4 + 1];
+                            const float z = rot_src[i * 4 + 2];
+                            const float w = rot_src[i * 4 + 3];
+                            // Match the tensor-op reference bit-for-bit: float
+                            // squares, double-accumulated sum, float sqrt.
+                            double sum_squared = 0.0;
+                            sum_squared += x * x;
+                            sum_squared += y * y;
+                            sum_squared += z * z;
+                            sum_squared += w * w;
+                            const float norm = std::max(std::sqrt(static_cast<float>(sum_squared)), 1e-12f);
+                            packed.rotation_normalized[i * 4 + 0] = x / norm;
+                            packed.rotation_normalized[i * 4 + 1] = y / norm;
+                            packed.rotation_normalized[i * 4 + 2] = z / norm;
+                            packed.rotation_normalized[i * 4 + 3] = w / norm;
+                        }
+                    });
+                packed.rotation = packed.rotation_normalized.data();
                 if (packed.sh_coeffs > 0) {
                     // shN is stored swizzled; unpack on CPU to avoid a canonical CUDA copy.
-                    const auto shN_canon = splat_data.shN_canonical_cpu();
-                    packed.shN = copy_f32(shN_canon, packed.count * static_cast<size_t>(packed.sh_coeffs) * 3);
+                    packed.shN_storage = splat_data.shN_canonical_cpu();
+                    packed.shN = packed.shN_storage.ptr<float>();
                 }
-
                 if (splat_data.lod_tree && splat_data.lod_tree->has_tree()) {
                     packed.lod_tree = true;
                     packed.child_count = splat_data.lod_tree->child_count;
@@ -2435,23 +2647,38 @@ namespace lfs::io {
                 // Decode chunks
                 size_t offset = 8 + pad8(meta_size);
 
-                std::vector<float> all_means;
-                std::vector<float> all_opacity;
-                std::vector<float> all_sh0;
-                std::vector<float> all_scales_linear;
-                std::vector<float> all_rotation;
-                std::vector<float> all_shN;
-                std::vector<uint16_t> all_child_count;
-                std::vector<uint32_t> all_child_start;
-                std::vector<lfs::core::SplatLodTree::ChunkFileRange> chunk_file_ranges;
-
                 const int max_sh = meta.max_sh.value_or(0);
                 const int sh_coeffs = max_sh > 0 ? SH_COEFFS_FOR_DEGREE[max_sh] : 0;
                 const bool has_lod_tree = meta.lod_tree.value_or(false);
+                const size_t N = meta.count;
+
+                bool lod_opacity_encoded = has_lod_tree;
+                if (meta.splat_encoding.has_value()) {
+                    const auto& enc = meta.splat_encoding.value();
+                    if (enc.is_object()) {
+                        auto it = enc.find("lodOpacity");
+                        if (it != enc.end() && it->is_boolean()) {
+                            lod_opacity_encoded = it->get<bool>();
+                        }
+                    }
+                }
+
+                struct ChunkSlice {
+                    RadChunkMeta meta;
+                    size_t origin = 0;
+                    size_t payload_start = 0;
+                    size_t chunk_end = 0;
+                    bool has_payload_prefix = false;
+                };
+
+                std::vector<ChunkSlice> slices;
+                slices.reserve(meta.chunks.size());
+                std::vector<lfs::core::SplatLodTree::ChunkFileRange> chunk_file_ranges;
                 if (has_lod_tree) {
                     chunk_file_ranges.reserve(meta.chunks.size());
                 }
 
+                uint64_t scanned_count = 0;
                 for (size_t chunk_idx = 0; chunk_idx < meta.chunks.size(); ++chunk_idx) {
                     const size_t chunk_file_offset = offset;
                     if (offset + 8 > data.size()) {
@@ -2509,237 +2736,143 @@ namespace lfs::io {
                         });
                     }
 
-                    const size_t chunk_count = static_cast<size_t>(chunk.count);
-                    std::vector<float> chunk_means(chunk_count * 3);
-                    std::vector<float> chunk_opacity(chunk_count);
-                    std::vector<float> chunk_sh0(chunk_count * 3);
-                    std::vector<float> chunk_scales(chunk_count * 3);
-                    std::vector<float> chunk_rotation(chunk_count * 4);
-                    std::vector<float> chunk_shN(chunk_count * sh_coeffs * 3, 0.0f);
-                    std::vector<uint16_t> chunk_child_count;
-                    std::vector<uint32_t> chunk_child_start;
-                    if (has_lod_tree) {
-                        chunk_child_count.resize(chunk_count);
-                        chunk_child_start.resize(chunk_count);
+                    // Chunks must tile [0, N) in file order for the parallel
+                    // slice writes below to be disjoint and complete.
+                    if (chunk.base != scanned_count || chunk.base + chunk.count > N) {
+                        return std::unexpected("RAD chunk base/count layout is inconsistent");
                     }
+                    scanned_count += chunk.count;
 
-                    // Temporary buffers for component data
-                    std::vector<float> comp_data(chunk_count);
-
-                    for (const auto& prop : chunk.properties) {
-                        // New format uses payload-relative offsets, legacy uses chunk-relative offsets.
-                        const size_t prop_offset = static_cast<size_t>(prop.offset);
-                        const size_t prop_bytes = static_cast<size_t>(prop.bytes);
-                        size_t absolute_offset = has_payload_prefix ? (payload_start + prop_offset) : (offset + prop_offset);
-                        if (absolute_offset + prop_bytes > chunk_end) {
-                            return std::unexpected("Property data exceeds file bounds");
-                        }
-
-                        // Decompress if needed (handle both "gz" and legacy "gzip")
-                        std::vector<uint8_t> prop_data;
-                        if (prop.compression.has_value() &&
-                            (prop.compression.value() == "gz" || prop.compression.value() == "gzip")) {
-                            prop_data = rad_decompress(&data[absolute_offset], prop_bytes);
-                            if (prop_data.empty()) {
-                                return std::unexpected("Failed to decompress property: " + prop.property);
-                            }
-                        } else {
-                            prop_data.assign(&data[absolute_offset], &data[absolute_offset + prop_bytes]);
-                        }
-
-                        // Decode based on property name
-                        if (prop.property == PROP_CENTER) {
-                            PropertyDecoder::decode_center(prop_data.data(), chunk_means.data(), 3, chunk_count, prop.encoding);
-                        } else if (prop.property.find(PROP_CENTER) == 0 && prop.property != PROP_CENTER) {
-                            // Legacy format: center_{0,1,2} per-component
-                            int comp = prop.property.back() - '0';
-                            PropertyDecoder::decode_center(prop_data.data(), comp_data.data(), 1, chunk_count, prop.encoding);
-                            for (size_t i = 0; i < chunk_count; ++i) {
-                                chunk_means[i * 3 + comp] = comp_data[i];
-                            }
-                        } else if (prop.property == PROP_ALPHA) {
-                            float min_val = prop.min_val.value_or(0.0f);
-                            float max_val = prop.max_val.value_or(1.0f);
-                            PropertyDecoder::decode_alpha(prop_data.data(), chunk_opacity.data(), chunk_count,
-                                                          prop.encoding, min_val, max_val);
-                        } else if (prop.property == PROP_RGB) {
-                            PropertyDecoder::decode_rgb(prop_data.data(), chunk_sh0.data(), 3, chunk_count,
-                                                        prop.encoding,
-                                                        prop.min_val.value_or(0.0f),
-                                                        prop.max_val.value_or(1.0f),
-                                                        prop.base.value_or(0.0f),
-                                                        prop.scale.value_or(1.0f));
-                        } else if (prop.property.find(PROP_RGB) == 0 && prop.property != PROP_RGB) {
-                            // Legacy format: rgb_{0,1,2} per-component
-                            int comp = prop.property.back() - '0';
-                            float min_val = prop.min_val.value_or(0.0f);
-                            float max_val = prop.max_val.value_or(1.0f);
-                            float base = prop.base.value_or(0.0f);
-                            float scale = prop.scale.value_or(1.0f);
-                            PropertyDecoder::decode_rgb(prop_data.data(), comp_data.data(), 1, chunk_count,
-                                                        prop.encoding, min_val, max_val, base, scale);
-                            for (size_t i = 0; i < chunk_count; ++i) {
-                                chunk_sh0[i * 3 + comp] = comp_data[i];
-                            }
-                        } else if (prop.property == PROP_SCALES) {
-                            PropertyDecoder::decode_scales(prop_data.data(), chunk_scales.data(), 3, chunk_count,
-                                                           prop.encoding,
-                                                           prop.min_val.value_or(0.0f),
-                                                           prop.max_val.value_or(prop.scale.value_or(1.0f)));
-                        } else if (prop.property.find(PROP_SCALES) == 0 && prop.property != PROP_SCALES) {
-                            // Legacy format: scales_{0,1,2} per-component
-                            int comp = prop.property.back() - '0';
-                            float min_val = prop.min_val.value_or(0.0f);
-                            float max_val = prop.max_val.value_or(prop.scale.value_or(1.0f));
-                            PropertyDecoder::decode_scales(prop_data.data(), comp_data.data(), 1, chunk_count,
-                                                           prop.encoding, min_val, max_val);
-                            for (size_t i = 0; i < chunk_count; ++i) {
-                                chunk_scales[i * 3 + comp] = comp_data[i];
-                            }
-                        } else if (prop.property == PROP_ORIENTATION) {
-                            std::vector<float> quat_data(chunk_count * 4);
-                            PropertyDecoder::decode_orientation(prop_data.data(), quat_data.data(), chunk_count, prop.encoding);
-                            // Convert from [x, y, z, w] to [w, x, y, z]
-                            for (size_t i = 0; i < chunk_count; ++i) {
-                                chunk_rotation[i * 4 + 0] = quat_data[i * 4 + 3]; // w
-                                chunk_rotation[i * 4 + 1] = quat_data[i * 4 + 0]; // x
-                                chunk_rotation[i * 4 + 2] = quat_data[i * 4 + 1]; // y
-                                chunk_rotation[i * 4 + 3] = quat_data[i * 4 + 2]; // z
-                            }
-                        } else if (prop.property == PROP_SH1 || prop.property == PROP_SH2 || prop.property == PROP_SH3) {
-                            int coeff_start = 0;
-                            int coeff_count = 0;
-                            if (prop.property == PROP_SH1) {
-                                coeff_start = 0;
-                                coeff_count = 3;
-                            } else if (prop.property == PROP_SH2) {
-                                coeff_start = 3;
-                                coeff_count = 5;
-                            } else {
-                                coeff_start = 8;
-                                coeff_count = 7;
-                            }
-
-                            const size_t dims = static_cast<size_t>(coeff_count) * 3;
-                            std::vector<float> sh_block(chunk_count * dims, 0.0f);
-                            PropertyDecoder::decode_sh(prop_data.data(), sh_block.data(), dims, chunk_count,
-                                                       prop.encoding,
-                                                       prop.min_val.value_or(0.0f),
-                                                       prop.max_val.value_or(1.0f),
-                                                       prop.base.value_or(0.0f),
-                                                       prop.scale.value_or(1.0f));
-
-                            for (size_t i = 0; i < chunk_count; ++i) {
-                                for (int c = 0; c < coeff_count; ++c) {
-                                    for (int ch = 0; ch < 3; ++ch) {
-                                        const int coeff = coeff_start + c;
-                                        if (coeff < sh_coeffs) {
-                                            chunk_shN[i * sh_coeffs * 3 + coeff * 3 + ch] =
-                                                sh_block[i * dims + c * 3 + ch];
-                                        }
-                                    }
-                                }
-                            }
-                        } else if (prop.property.find("sh") == 0) {
-                            // Legacy format: sh{1,2,3}_{coeff}_{channel}
-                            size_t first_underscore = prop.property.find('_');
-                            size_t second_underscore = prop.property.find('_', first_underscore + 1);
-                            if (first_underscore != std::string::npos && second_underscore != std::string::npos) {
-                                int coeff = std::stoi(prop.property.substr(first_underscore + 1, second_underscore - first_underscore - 1));
-                                int ch = prop.property.back() - '0';
-                                PropertyDecoder::decode_sh(prop_data.data(), comp_data.data(), 1, chunk_count,
-                                                           prop.encoding,
-                                                           prop.min_val.value_or(0.0f),
-                                                           prop.max_val.value_or(1.0f),
-                                                           prop.base.value_or(0.0f),
-                                                           prop.scale.value_or(1.0f));
-                                for (size_t i = 0; i < chunk_count; ++i) {
-                                    chunk_shN[i * sh_coeffs * 3 + coeff * 3 + ch] = comp_data[i];
-                                }
-                            }
-                        } else if (prop.property == PROP_CHILD_COUNT) {
-                            if (prop_data.size() >= chunk_count * 2) {
-                                for (size_t i = 0; i < chunk_count; ++i) {
-                                    chunk_child_count[i] = decode_u16(&prop_data[i * 2]);
-                                }
-                            }
-                        } else if (prop.property == PROP_CHILD_START) {
-                            if (prop_data.size() >= chunk_count * 4) {
-                                for (size_t i = 0; i < chunk_count; ++i) {
-                                    chunk_child_start[i] = decode_u32(&prop_data[i * 4]);
-                                }
-                            }
-                        }
-                    }
-
-                    // Append chunk data to global arrays
-                    all_means.insert(all_means.end(), chunk_means.begin(), chunk_means.end());
-                    all_opacity.insert(all_opacity.end(), chunk_opacity.begin(), chunk_opacity.end());
-                    all_sh0.insert(all_sh0.end(), chunk_sh0.begin(), chunk_sh0.end());
-                    all_scales_linear.insert(all_scales_linear.end(), chunk_scales.begin(), chunk_scales.end());
-                    all_rotation.insert(all_rotation.end(), chunk_rotation.begin(), chunk_rotation.end());
-                    all_shN.insert(all_shN.end(), chunk_shN.begin(), chunk_shN.end());
-                    if (has_lod_tree) {
-                        all_child_count.insert(all_child_count.end(), chunk_child_count.begin(), chunk_child_count.end());
-                        all_child_start.insert(all_child_start.end(), chunk_child_start.begin(), chunk_child_start.end());
-                    }
-
-                    // Move to next chunk
+                    slices.push_back({std::move(chunk), chunk_file_offset, payload_start, chunk_end, has_payload_prefix});
                     offset = chunk_end;
                 }
-
-                // Create tensors
-                const size_t N = meta.count;
-
-                // RAD stores display RGB in SH0 slot (0.5 + SH_C0 * sh0_raw).
-                // Convert back to optimizer-domain sh0_raw expected by SplatData.
-                for (float& v : all_sh0) {
-                    v = (v - 0.5f) / SH_C0;
+                if (scanned_count != N) {
+                    return std::unexpected("RAD chunk counts do not sum to splat count");
                 }
 
-                bool lod_opacity_encoded = has_lod_tree;
-                if (meta.splat_encoding.has_value()) {
-                    const auto& enc = meta.splat_encoding.value();
-                    if (enc.is_object()) {
-                        auto it = enc.find("lodOpacity");
-                        if (it != enc.end() && it->is_boolean()) {
-                            lod_opacity_encoded = it->get<bool>();
-                        }
-                    }
-                }
-                if (!lod_opacity_encoded) {
-                    // RAD stores activated opacity alpha in [0, 1]. Convert back to
-                    // optimizer-domain logits expected by SplatData.
-                    for (float& v : all_opacity) {
-                        const float a = std::clamp(v, 1.0e-6f, 1.0f - 1.0e-6f);
-                        v = std::log(a / (1.0f - a));
-                    }
-                } else {
-                    // Spark LOD opacity encoding stores display-space alpha directly and
-                    // can legitimately exceed 1.0 for dense merged nodes.
-                    for (float& v : all_opacity) {
-                        v = std::max(v, 0.0f);
-                    }
-                }
-
-                Tensor means_tensor = Tensor::from_vector(all_means, {N, 3}, Device::CPU);
-                Tensor opacity_tensor = Tensor::from_vector(all_opacity, {N, 1}, Device::CPU);
-                Tensor sh0_tensor = Tensor::from_vector(all_sh0, {N, 1, 3}, Device::CPU);
-                // RAD stores activated (linear) scale values. SplatData expects
-                // optimizer-domain scaling_raw (log-space), so convert here.
-                std::vector<float> all_scales_raw = all_scales_linear;
-                for (float& v : all_scales_raw) {
-                    v = std::log(std::max(v, 1.0e-8f));
-                }
-                Tensor scales_tensor = Tensor::from_vector(all_scales_raw, {N, 3}, Device::CPU);
-                Tensor rotation_tensor = Tensor::from_vector(all_rotation, {N, 4}, Device::CPU);
-
+                // Decode straight into the output tensors, one chunk per task.
+                Tensor means_tensor = Tensor::empty({N, 3}, Device::CPU, lfs::core::DataType::Float32);
+                Tensor opacity_tensor = Tensor::empty({N, 1}, Device::CPU, lfs::core::DataType::Float32);
+                Tensor sh0_tensor = Tensor::empty({N, 1, 3}, Device::CPU, lfs::core::DataType::Float32);
+                Tensor scales_tensor = Tensor::empty({N, 3}, Device::CPU, lfs::core::DataType::Float32);
+                Tensor rotation_tensor = Tensor::empty({N, 4}, Device::CPU, lfs::core::DataType::Float32);
                 Tensor shN_tensor;
                 if (sh_coeffs > 0) {
-                    shN_tensor = Tensor::from_vector(all_shN, {N, static_cast<size_t>(sh_coeffs), 3}, Device::CPU);
+                    shN_tensor = Tensor::empty({N, static_cast<size_t>(sh_coeffs), 3}, Device::CPU,
+                                               lfs::core::DataType::Float32);
                 }
 
-                // Create SplatData
+                float* const all_means = means_tensor.ptr<float>();
+                float* const all_opacity = opacity_tensor.ptr<float>();
+                float* const all_sh0 = sh0_tensor.ptr<float>();
+                float* const all_scales = scales_tensor.ptr<float>();
+                float* const all_rotation = rotation_tensor.ptr<float>();
+                float* const all_shN = sh_coeffs > 0 ? shN_tensor.ptr<float>() : nullptr;
+
+                std::vector<uint16_t> all_child_count;
+                std::vector<uint32_t> all_child_start;
+                auto tree = has_lod_tree ? std::make_unique<lfs::core::SplatLodTree>() : nullptr;
+                if (has_lod_tree) {
+                    all_child_count.resize(N);
+                    all_child_start.resize(N);
+                    tree->centers.resize(N);
+                    tree->sizes.resize(N);
+                }
+
+                std::atomic<bool> failed{false};
+                std::mutex error_mutex;
+                std::string decode_error;
+                auto record_error = [&](std::string msg) {
+                    failed.store(true, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (decode_error.empty()) {
+                        decode_error = std::move(msg);
+                    }
+                };
+
+                tbb::parallel_for(
+                    tbb::blocked_range<size_t>(0, slices.size(), 1),
+                    [&](const tbb::blocked_range<size_t>& range) {
+                        for (size_t chunk_idx = range.begin(); chunk_idx != range.end(); ++chunk_idx) {
+                            if (failed.load(std::memory_order_relaxed)) {
+                                return;
+                            }
+                            const ChunkSlice& slice = slices[chunk_idx];
+                            const size_t base = static_cast<size_t>(slice.meta.base);
+                            const size_t chunk_count = static_cast<size_t>(slice.meta.count);
+
+                            float* const means = all_means + base * 3;
+                            float* const opacity = all_opacity + base;
+                            float* const sh0 = all_sh0 + base * 3;
+                            float* const scales = all_scales + base * 3;
+                            float* const rotation = all_rotation + base * 4;
+                            float* const shN =
+                                all_shN != nullptr ? all_shN + base * static_cast<size_t>(sh_coeffs) * 3 : nullptr;
+
+                            std::memset(means, 0, chunk_count * 3 * sizeof(float));
+                            std::memset(opacity, 0, chunk_count * sizeof(float));
+                            std::memset(sh0, 0, chunk_count * 3 * sizeof(float));
+                            std::memset(scales, 0, chunk_count * 3 * sizeof(float));
+                            std::memset(rotation, 0, chunk_count * 4 * sizeof(float));
+                            if (shN != nullptr) {
+                                std::memset(shN, 0, chunk_count * static_cast<size_t>(sh_coeffs) * 3 * sizeof(float));
+                            }
+
+                            auto err = decode_chunk_properties(
+                                data.data(), slice.meta, slice.origin, slice.payload_start,
+                                slice.has_payload_prefix, slice.chunk_end, sh_coeffs,
+                                means, opacity, sh0, scales, rotation, shN,
+                                has_lod_tree ? all_child_count.data() + base : nullptr,
+                                has_lod_tree ? all_child_start.data() + base : nullptr);
+                            if (err.has_value()) {
+                                record_error(std::move(*err));
+                                return;
+                            }
+
+                            // RAD stores display RGB in the SH0 slot and activated
+                            // alpha/scale values; convert back to optimizer domain.
+                            for (size_t i = 0; i < chunk_count * 3; ++i) {
+                                sh0[i] = (sh0[i] - 0.5f) / SH_C0;
+                            }
+                            if (!lod_opacity_encoded) {
+                                for (size_t i = 0; i < chunk_count; ++i) {
+                                    const float a = std::clamp(opacity[i], 1.0e-6f, 1.0f - 1.0e-6f);
+                                    opacity[i] = std::log(a / (1.0f - a));
+                                }
+                            } else {
+                                // Spark LOD opacity encoding stores display-space alpha
+                                // directly and can exceed 1.0 for dense merged nodes.
+                                for (size_t i = 0; i < chunk_count; ++i) {
+                                    opacity[i] = std::max(opacity[i], 0.0f);
+                                }
+                            }
+                            if (tree) {
+                                for (size_t i = 0; i < chunk_count; ++i) {
+                                    tree->centers[base + i] =
+                                        glm::vec3(means[i * 3 + 0], means[i * 3 + 1], means[i * 3 + 2]);
+                                    const float max_scale =
+                                        std::max({scales[i * 3 + 0], scales[i * 3 + 1], scales[i * 3 + 2]});
+                                    float expansion = 1.0f;
+                                    if (lod_opacity_encoded) {
+                                        const float lod_alpha = std::max(opacity[i], 0.0f);
+                                        if (lod_alpha > 1.0f) {
+                                            const float spark_lod_opacity = std::min(lod_alpha * 4.0f - 3.0f, 5.0f);
+                                            expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
+                                        }
+                                    }
+                                    tree->sizes[base + i] = 2.0f * expansion * max_scale;
+                                }
+                            }
+                            for (size_t i = 0; i < chunk_count * 3; ++i) {
+                                scales[i] = std::log(std::max(scales[i], 1.0e-8f));
+                            }
+                        }
+                    });
+
+                if (failed.load()) {
+                    return std::unexpected(decode_error);
+                }
+
                 SplatData splat_data(
                     max_sh,
                     std::move(means_tensor),
@@ -2752,11 +2885,7 @@ namespace lfs::io {
                 );
 
                 // Attach LOD tree if present
-                if (!all_child_count.empty()) {
-                    if (all_child_count.size() != N || all_child_start.size() != N) {
-                        return std::unexpected("RAD LOD tree size mismatch");
-                    }
-                    auto tree = std::make_unique<lfs::core::SplatLodTree>();
+                if (tree && N > 0) {
                     tree->child_count = std::move(all_child_count);
                     tree->child_start = std::move(all_child_start);
                     // RAD files don't store node depths; derive them in one
@@ -2790,29 +2919,6 @@ namespace lfs::io {
                         tree->rad_source.chunk_size = meta.chunk_size.value_or(CHUNK_SIZE);
                         tree->rad_source.metadata_bytes = 8 + pad8(meta_size);
                         tree->rad_source.chunks = std::move(chunk_file_ranges);
-                    }
-                    tree->centers.reserve(N);
-                    tree->sizes.reserve(N);
-                    for (size_t i = 0; i < N; ++i) {
-                        const float cx = all_means[i * 3 + 0];
-                        const float cy = all_means[i * 3 + 1];
-                        const float cz = all_means[i * 3 + 2];
-                        tree->centers.emplace_back(cx, cy, cz);
-
-                        const float sx = all_scales_linear[i * 3 + 0];
-                        const float sy = all_scales_linear[i * 3 + 1];
-                        const float sz = all_scales_linear[i * 3 + 2];
-                        const float max_scale = std::max({sx, sy, sz});
-                        float expansion = 1.0f;
-                        if (lod_opacity_encoded) {
-                            const float lod_alpha = std::max(all_opacity[i], 0.0f);
-                            if (lod_alpha > 1.0f) {
-                                const float spark_lod_opacity = std::min(lod_alpha * 4.0f - 3.0f, 5.0f);
-                                expansion = 1.0f + 0.7f * (spark_lod_opacity - 1.0f);
-                            }
-                        }
-                        const float size = 2.0f * expansion * max_scale;
-                        tree->sizes.push_back(size);
                     }
                     tree->lod_opacity_encoded = lod_opacity_encoded;
                     splat_data.lod_tree = std::move(tree);

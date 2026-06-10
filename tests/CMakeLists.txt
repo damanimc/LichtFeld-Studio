@@ -83,6 +83,7 @@ message(STATUS "Tests: LibTorch ${Torch_VERSION} found for tensor comparison tes
 # Benchmark sources (performance measurement focused)
 set(BENCHMARK_FILES
     benchmark_background_blend.cpp
+    benchmark_rad_io.cpp
     benchmark_grad_alpha_layout.cpp
     benchmark_pipelined_loader.cpp
     benchmark_slice_assignment.cpp

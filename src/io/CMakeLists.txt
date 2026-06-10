@@ -251,6 +251,7 @@ target_link_libraries(lfs_io
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
         ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
+        $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         CUDA::cudart           # CUDA runtime for nvImageCodec
         lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
         lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
