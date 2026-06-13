@@ -80,6 +80,12 @@ class _DocumentStub:
             return self.body
         return None
 
+    def add_event_listener(self, event_name, callback):
+        pass
+
+    def query_selector_all(self, selector):
+        return []
+
     def create_data_model(self, name):
         self.created_models.append(name)
         return self.model

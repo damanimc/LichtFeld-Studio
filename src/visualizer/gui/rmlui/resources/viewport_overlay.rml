@@ -626,11 +626,6 @@
                                step="0.05"
                                data-value="depth_view_near_value"
                                data-attrif-disabled="!depth_view_has_scene" />
-                        <input type="text"
-                               class="number-input viewport-selection-depth-input viewport-depth-input"
-                               id="depth-view-near"
-                               data-value="depth_view_near_str"
-                               data-attrif-disabled="!depth_view_has_scene" />
                     </div>
                     <div class="viewport-transform-axis viewport-selection-depth-axis viewport-depth-axis" data-tooltip="tooltip.depth_view_far">
                         <span class="viewport-transform-axis-label">Far</span>
@@ -642,11 +637,6 @@
                                data-attr-max="depth_view_far_slider_max"
                                step="0.05"
                                data-value="depth_view_far_value"
-                               data-attrif-disabled="!depth_view_has_scene" />
-                        <input type="text"
-                               class="number-input viewport-selection-depth-input viewport-depth-input"
-                               id="depth-view-far"
-                               data-value="depth_view_far_str"
                                data-attrif-disabled="!depth_view_has_scene" />
                     </div>
                 </div>

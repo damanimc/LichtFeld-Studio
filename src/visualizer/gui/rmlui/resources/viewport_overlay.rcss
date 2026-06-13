@@ -314,8 +314,8 @@ body {
 }
 
 .viewport-depth-axis > .viewport-transform-axis-label {
-    width: 28dp;
-    min-width: 28dp;
+    width: auto;
+    min-width: 0;
     font-size: 12dp;
     line-height: 24dp;
     text-align: left;
@@ -354,6 +354,13 @@ body {
     min-height: 22dp;
     line-height: 16dp;
     padding: 2dp 5dp;
+}
+
+#depth-view-block .viewport-depth-axis > .scrub-field {
+    width: 150dp;
+    min-width: 150dp;
+    height: 22dp;
+    min-height: 22dp;
 }
 
 .viewport-selection-actions {
@@ -396,6 +403,7 @@ body {
     padding: 5dp 6dp;
     border-radius: 6dp;
     gap: 0;
+    min-width: 0;
 }
 
 .viewport-transform-panel.viewport-export-panel {

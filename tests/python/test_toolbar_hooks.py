@@ -183,6 +183,12 @@ class _DocumentStub:
     def get_element_by_id(self, element_id):
         return self.elements.get(element_id)
 
+    def add_event_listener(self, event_name, callback):
+        pass
+
+    def query_selector_all(self, selector):
+        return []
+
 
 def _install_timer_stub(module, monkeypatch):
     timers = []
