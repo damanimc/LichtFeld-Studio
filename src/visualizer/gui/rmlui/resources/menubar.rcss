@@ -32,6 +32,47 @@ body {
     decorator: none;
 }
 
+#menu-toolbar {
+    position: absolute;
+    top: 0;
+    right: 12dp;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 30dp;
+    gap: 1dp;
+}
+
+.menu-toolbar-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24dp;
+    height: 24dp;
+    min-width: 24dp;
+    min-height: 24dp;
+    padding: 3dp;
+    border-width: 1dp;
+    border-color: transparent;
+    border-radius: 6dp;
+    box-sizing: border-box;
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: background-color border-color 0.12s quadratic-out;
+}
+
+.menu-toolbar-btn img {
+    width: 18dp;
+    height: 18dp;
+}
+
+.menu-toolbar-separator {
+    width: 1dp;
+    height: 18dp;
+    margin: 0 5dp;
+    flex-shrink: 0;
+}
+
 #menu-items {
     display: flex;
     flex-direction: row;

@@ -5,18 +5,27 @@
 #include "gui/rml_menu_bar.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/services.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
+#include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
+#include "input/input_controller.hpp"
 #include "internal/resource_paths.hpp"
+#include "ipc/view_context.hpp"
 #include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
+#include "rendering/dirty_flags.hpp"
+#include "rendering/rendering_manager.hpp"
+#include "rendering/rendering_types.hpp"
 #include "theme/theme.hpp"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
 #include <cassert>
+#include <cmath>
 #include <format>
+#include <glm/glm.hpp>
 
 namespace lfs::vis::gui {
 
@@ -223,8 +232,20 @@ namespace lfs::vis::gui {
             handle.RegisterMember("children", &MenuDropdownRootView::children);
         }
         ctor.RegisterArray<std::vector<MenuDropdownRootView>>();
+        if (auto handle = ctor.RegisterStruct<MenuToolbarButtonView>()) {
+            handle.RegisterMember("button_id", &MenuToolbarButtonView::button_id);
+            handle.RegisterMember("action", &MenuToolbarButtonView::action);
+            handle.RegisterMember("value", &MenuToolbarButtonView::value);
+            handle.RegisterMember("icon_src", &MenuToolbarButtonView::icon_src);
+            handle.RegisterMember("tooltip_key", &MenuToolbarButtonView::tooltip_key);
+            handle.RegisterMember("tooltip_text", &MenuToolbarButtonView::tooltip_text);
+            handle.RegisterMember("selected", &MenuToolbarButtonView::selected);
+        }
+        ctor.RegisterArray<std::vector<MenuToolbarButtonView>>();
         ctor.Bind("menu_labels", &menu_labels_);
         ctor.Bind("dropdown_items", &dropdown_items_);
+        ctor.Bind("menu_render_buttons", &render_buttons_);
+        ctor.Bind("menu_projection_buttons", &projection_buttons_);
         menu_model_ = ctor.GetModelHandle();
 
         try {
@@ -245,6 +266,8 @@ namespace lfs::vis::gui {
         dropdown_container_ = document_->GetElementById("dropdown-container");
         dropdown_popup_ = document_->GetElementById("dropdown-popup");
         brand_logo_ = document_->GetElementById("brand-logo");
+        menu_toolbar_ = document_->GetElementById("menu-toolbar");
+        body_el_ = document_->GetElementById("body");
 
         render_needed_ = true;
         updateTheme();
@@ -254,6 +277,8 @@ namespace lfs::vis::gui {
         menu_model_ = {};
         menu_labels_.clear();
         dropdown_items_.clear();
+        render_buttons_.clear();
+        projection_buttons_.clear();
         open_menu_idname_.clear();
         if (rml_manager_)
             rml_manager_->releaseCachedVulkanContext(direct_cache_);
@@ -266,6 +291,8 @@ namespace lfs::vis::gui {
         dropdown_popup_ = nullptr;
         dropdown_overlay_ = nullptr;
         brand_logo_ = nullptr;
+        menu_toolbar_ = nullptr;
+        body_el_ = nullptr;
     }
 
     void RmlMenuBar::suspend() {
@@ -274,6 +301,8 @@ namespace lfs::vis::gui {
         last_mouse_x_ = 0;
         last_mouse_y_ = 0;
         last_hovered_label_ = -1;
+        last_toolbar_hovered_ = false;
+        tooltip_.setHover({}, nullptr);
 
         if (open_menu_index_ >= 0)
             closeDropdown();
@@ -297,6 +326,9 @@ namespace lfs::vis::gui {
         dropdown_popup_ = nullptr;
         dropdown_overlay_ = nullptr;
         brand_logo_ = nullptr;
+        menu_toolbar_ = nullptr;
+        body_el_ = nullptr;
+        tooltip_.setHover({}, nullptr);
         base_rcss_.clear();
         has_theme_signature_ = false;
         wants_input_ = false;
@@ -327,9 +359,14 @@ namespace lfs::vis::gui {
         dropdown_container_ = document_->GetElementById("dropdown-container");
         dropdown_popup_ = document_->GetElementById("dropdown-popup");
         brand_logo_ = document_->GetElementById("brand-logo");
+        menu_toolbar_ = document_->GetElementById("menu-toolbar");
+        body_el_ = document_->GetElementById("body");
+        applied_toolbar_right_ = -1.0f;
 
         rebuildLabels();
         menu_model_.DirtyVariable("dropdown_items");
+        menu_model_.DirtyVariable("menu_render_buttons");
+        menu_model_.DirtyVariable("menu_projection_buttons");
         updateTheme();
     }
 
@@ -387,7 +424,7 @@ namespace lfs::vis::gui {
         const float my = input.mouse_y - input.screen_y;
         const bool is_open = open_menu_index_ >= 0;
         const int ctx_w = input.screen_w;
-        const int ctx_h = is_open
+        const int ctx_h = (is_open || tooltip_.hasActiveState())
                               ? input.screen_h
                               : static_cast<int>(bar_height_ * rml_manager_->getDpRatio());
         const int rml_mx = static_cast<int>(mx);
@@ -409,7 +446,7 @@ namespace lfs::vis::gui {
         const bool context_size_unchanged = ctx_w == last_ctx_w_ && ctx_h == last_ctx_h_;
         if (mouse_pos_valid_ && !mouse_moved && !pointer_event && !pointer_down &&
             context_size_unchanged && !render_needed_) {
-            wants_input_ = is_open || last_hovered_label_ >= 0;
+            wants_input_ = is_open || last_hovered_label_ >= 0 || last_toolbar_hovered_;
             return;
         }
         if (mouse_moved && (is_open || was_in_context || is_in_context)) {
@@ -432,6 +469,14 @@ namespace lfs::vis::gui {
             }
         }
         last_hovered_label_ = hovered_label;
+
+        Rml::Element* hovered_toolbar_btn =
+            (!is_open && hovered_label < 0) ? toolbarButtonAtPoint(mx, my) : nullptr;
+        last_toolbar_hovered_ = hovered_toolbar_btn != nullptr;
+        if (hovered_toolbar_btn)
+            tooltip_.setHover(resolveRmlTooltip(hovered_toolbar_btn), hovered_toolbar_btn);
+        else
+            tooltip_.setHover({}, nullptr);
 
         if (is_open) {
             wants_input_ = true;
@@ -489,7 +534,15 @@ namespace lfs::vis::gui {
                 }
             }
         } else {
-            if (hovered_label >= 0) {
+            if (hovered_toolbar_btn) {
+                wants_input_ = true;
+                if (input.mouse_clicked[0]) {
+                    dispatchToolbarAction(
+                        hovered_toolbar_btn->GetAttribute<Rml::String>("data-action", ""),
+                        hovered_toolbar_btn->GetAttribute<Rml::String>("data-value", ""));
+                    return;
+                }
+            } else if (hovered_label >= 0) {
                 wants_input_ = true;
                 if (input.mouse_clicked[0]) {
                     openDropdown(hovered_label);
@@ -601,6 +654,140 @@ namespace lfs::vis::gui {
         return -1;
     }
 
+    void RmlMenuBar::rebuildToolbarButtons() {
+        std::vector<MenuToolbarButtonView> render_buttons;
+        std::vector<MenuToolbarButtonView> projection_buttons;
+
+        if (const auto* rm = lfs::vis::services().renderingOrNull()) {
+            const auto settings = rm->getSettings();
+
+            std::string active_mode = "splats";
+            if (settings.point_cloud_mode)
+                active_mode = "points";
+            else if (settings.show_rings)
+                active_mode = "rings";
+            else if (settings.show_center_markers)
+                active_mode = "centers";
+
+            const auto make = [](std::string id, std::string action, std::string value,
+                                 std::string icon, std::string tooltip_key,
+                                 std::string tooltip_text, bool selected) {
+                return MenuToolbarButtonView{
+                    .button_id = std::move(id),
+                    .action = std::move(action),
+                    .value = std::move(value),
+                    .icon_src = "../icon/" + std::move(icon) + ".png",
+                    .tooltip_key = std::move(tooltip_key),
+                    .tooltip_text = std::move(tooltip_text),
+                    .selected = selected,
+                };
+            };
+
+            render_buttons.push_back(make("menu-render-splats", "set_render_mode", "splats", "blob",
+                                          "toolbar.splat_rendering", "Splat Rendering",
+                                          active_mode == "splats"));
+            render_buttons.push_back(make("menu-render-points", "set_render_mode", "points",
+                                          "dots-diagonal", "toolbar.point_cloud", "Point Cloud",
+                                          active_mode == "points"));
+            render_buttons.push_back(make("menu-render-rings", "set_render_mode", "rings", "ring",
+                                          "toolbar.gaussian_rings", "Gaussian Rings",
+                                          active_mode == "rings"));
+            render_buttons.push_back(make("menu-render-centers", "set_render_mode", "centers",
+                                          "circle-dot", "toolbar.center_markers", "Center Markers",
+                                          active_mode == "centers"));
+
+            const bool ortho = settings.orthographic;
+            projection_buttons.push_back(make("menu-projection", "toggle_projection", "",
+                                              ortho ? "box" : "perspective",
+                                              ortho ? "toolbar.orthographic" : "toolbar.perspective",
+                                              ortho ? "Orthographic" : "Perspective", ortho));
+            projection_buttons.push_back(make("menu-depth-view", "toggle_depth_view", "", "depth-map",
+                                              "toolbar.depth_map", "Depth Map", settings.depth_view));
+
+            bool view_snap = false;
+            if (const auto* ic = lfs::vis::InputController::instance())
+                view_snap = ic->cameraViewSnapEnabled();
+            projection_buttons.push_back(make("menu-view-snap", "toggle_camera_view_snap", "", "check",
+                                              "", "Snap Axis Views", view_snap));
+            projection_buttons.push_back(make(
+                "menu-split-view", "toggle_independent_split_view", "", "layout-columns", "",
+                "Independent Split View",
+                settings.split_view_mode == lfs::vis::SplitViewMode::IndependentDual));
+        }
+
+        if (render_buttons != render_buttons_) {
+            render_buttons_ = std::move(render_buttons);
+            menu_model_.DirtyVariable("menu_render_buttons");
+            render_needed_ = true;
+        }
+        if (projection_buttons != projection_buttons_) {
+            projection_buttons_ = std::move(projection_buttons);
+            menu_model_.DirtyVariable("menu_projection_buttons");
+            render_needed_ = true;
+        }
+    }
+
+    void RmlMenuBar::dispatchToolbarAction(const std::string& action, const std::string& value) {
+        auto* rm = lfs::vis::services().renderingOrNull();
+
+        if (action == "set_render_mode") {
+            if (!rm)
+                return;
+            auto settings = rm->getSettings();
+            const bool enable_point_cloud = value == "points";
+            const bool point_cloud_changed = settings.point_cloud_mode != enable_point_cloud;
+            settings.point_cloud_mode = enable_point_cloud;
+            settings.show_rings = value == "rings";
+            settings.show_center_markers = value == "centers";
+            rm->updateSettings(settings,
+                               point_cloud_changed && enable_point_cloud
+                                   ? lfs::vis::DirtyFlag::ALL
+                                   : lfs::vis::DirtyFlag::SELECTION);
+        } else if (action == "toggle_projection") {
+            if (!rm)
+                return;
+            const bool ortho = rm->getSettings().orthographic;
+            float viewport_height = 0.0f;
+            float distance_to_pivot = 0.0f;
+            if (const auto view = lfs::vis::get_current_view_info(); view.has_value()) {
+                viewport_height = static_cast<float>(view->height);
+                const glm::vec3 eye(view->translation[0], view->translation[1], view->translation[2]);
+                const glm::vec3 pivot(view->pivot[0], view->pivot[1], view->pivot[2]);
+                distance_to_pivot = glm::length(pivot - eye);
+            }
+            rm->setOrthographic(!ortho, viewport_height, distance_to_pivot);
+        } else if (action == "toggle_depth_view") {
+            if (!rm)
+                return;
+            auto settings = rm->getSettings();
+            settings.depth_view = !settings.depth_view;
+            rm->updateSettings(settings, lfs::vis::DirtyFlag::ALL);
+        } else if (action == "toggle_camera_view_snap") {
+            if (auto* ic = lfs::vis::InputController::instance())
+                ic->setCameraViewSnapEnabled(!ic->cameraViewSnapEnabled());
+        } else if (action == "toggle_independent_split_view") {
+            if (auto* ic = lfs::vis::InputController::instance())
+                ic->toggleIndependentSplitView();
+        }
+
+        render_needed_ = true;
+    }
+
+    Rml::Element* RmlMenuBar::toolbarButtonAtPoint(const float x, const float y) const {
+        if (!menu_toolbar_)
+            return nullptr;
+        for (int i = 0; i < menu_toolbar_->GetNumChildren(); ++i) {
+            auto* child = menu_toolbar_->GetChild(i);
+            if (!child->HasAttribute("data-action"))
+                continue;
+            const auto box = child->GetAbsoluteOffset(Rml::BoxArea::Border);
+            const auto size = child->GetBox().GetSize(Rml::BoxArea::Border);
+            if (x >= box.x && x < box.x + size.x && y >= box.y && y < box.y + size.y)
+                return child;
+        }
+        return nullptr;
+    }
+
     void RmlMenuBar::rebuildDropdownDOM() {
         if (!dropdown_container_ || !dropdown_popup_ || !dropdown_overlay_ || !menu_items_)
             return;
@@ -660,21 +847,42 @@ namespace lfs::vis::gui {
         if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface())
             return;
         const bool theme_changed = updateTheme();
+        rebuildToolbarButtons();
 
         const float dp_ratio = rml_manager_->getDpRatio();
         const int bar_h = static_cast<int>(bar_height_ * dp_ratio);
 
-        int ctx_w = screen_w;
-        int ctx_h;
-
-        if (open_menu_index_ >= 0) {
-            ctx_h = screen_h;
-        } else {
-            ctx_h = bar_h;
+        // Right-align the toolbar to the viewport's right edge (just before the
+        // dock panel) rather than the full-width bar edge. A small inset keeps
+        // the buttons off the panel boundary.
+        if (menu_toolbar_) {
+            const float inset = 8.0f * dp_ratio;
+            float right_px = 12.0f * dp_ratio;
+            if (viewport_right_edge_ > 0.0f)
+                right_px = std::max(0.0f, static_cast<float>(screen_w) - viewport_right_edge_ + inset);
+            if (std::abs(right_px - applied_toolbar_right_) > 0.5f) {
+                menu_toolbar_->SetProperty("right", std::format("{:.1f}px", right_px));
+                applied_toolbar_right_ = right_px;
+                render_needed_ = true;
+            }
         }
 
+        int ctx_w = screen_w;
+        // A closed menu bar only occupies the bar strip, but a dropdown or a
+        // tooltip needs the full height so it is not clipped below the bar.
+        int ctx_h = (open_menu_index_ >= 0 || tooltip_.hasActiveState()) ? screen_h : bar_h;
+
+        bool tooltip_changed = false;
+        if (tooltip_.hasActiveState()) {
+            if (!body_el_)
+                body_el_ = document_->GetElementById("body");
+            tooltip_changed = tooltip_.apply(body_el_, last_mouse_x_, last_mouse_y_, ctx_w, ctx_h);
+        }
+        rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.needsFrame());
+
         const bool size_changed = (ctx_w != last_ctx_w_ || ctx_h != last_ctx_h_);
-        const bool refresh_cache = render_needed_ || theme_changed || size_changed || direct_cache_.texture == 0;
+        const bool refresh_cache = render_needed_ || theme_changed || size_changed ||
+                                   tooltip_changed || direct_cache_.texture == 0;
 
         if (refresh_cache) {
             rml_context_->SetDimensions(Rml::Vector2i(ctx_w, ctx_h));

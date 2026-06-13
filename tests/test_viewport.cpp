@@ -143,13 +143,24 @@ TEST(ViewportTest, WasdAdvanceSupportsFlatAdditionalSpeedInVisualizerSpace) {
     viewport.camera.t = glm::vec3(0.0f);
     viewport.camera.pivot = glm::vec3(0.0f);
 
-    viewport.camera.advance_forward(1.0f, 20.0f);
+    constexpr float dt = 0.1f;
+    constexpr float bonus = 20.0f;
+    for (int i = 0; i < 100; ++i)
+        viewport.camera.advanceWasd(dt, true, false, false, false, false, false, bonus);
 
+    const glm::vec3 t_before = viewport.camera.t;
+    const glm::vec3 pivot_before = viewport.camera.pivot;
+    viewport.camera.advanceWasd(dt, true, false, false, false, false, false, bonus);
+    const glm::vec3 t_step = viewport.camera.t - t_before;
+    const glm::vec3 pivot_step = viewport.camera.pivot - pivot_before;
+
+    // Once the inertial velocity saturates, a settled step advances along -Z at
+    // (wasdSpeed + bonus), confirming the bonus is additive, not multiplicative.
     EXPECT_FLOAT_EQ(viewport.camera.getWasdSpeed(), 6.0f);
-    EXPECT_NEAR(viewport.camera.t.x, 0.0f, 1e-5f);
-    EXPECT_NEAR(viewport.camera.t.y, 0.0f, 1e-5f);
-    EXPECT_NEAR(viewport.camera.t.z, -26.0f, 1e-5f);
-    EXPECT_NEAR(viewport.camera.pivot.z, -26.0f, 1e-5f);
+    EXPECT_NEAR(t_step.x, 0.0f, 1e-5f);
+    EXPECT_NEAR(t_step.y, 0.0f, 1e-5f);
+    EXPECT_NEAR(t_step.z, -(6.0f + bonus) * dt, 1e-4f);
+    EXPECT_NEAR(glm::length(pivot_step - t_step), 0.0f, 1e-5f);
 }
 
 TEST(ViewportTest, OrbitDraggingRightMovesCameraLeftAroundPivot) {

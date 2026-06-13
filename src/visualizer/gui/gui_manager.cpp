@@ -5450,8 +5450,11 @@ namespace lfs::vis::gui {
             if (rml_menu_bar_.wantsInput())
                 guiFocusState().want_capture_mouse = true;
 
-            if (!vulkan_gui_)
+            if (!vulkan_gui_) {
+                rml_menu_bar_.setViewportRightEdge(
+                    viewport_layout_.pos.x + viewport_layout_.size.x - menu_input.screen_x);
                 rml_menu_bar_.draw(menu_input.screen_w, menu_input.screen_h);
+            }
         } else {
             LOG_TIMER_THRESHOLD("gui_render.panel_setup.menu_bar_suspend", 0.25);
             rml_menu_bar_.suspend();
@@ -6178,6 +6181,8 @@ namespace lfs::vis::gui {
             LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render", 0.25);
             if (menu_bar_ && !ui_hidden_) {
                 LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render.menu_bar", 0.25);
+                rml_menu_bar_.setViewportRightEdge(
+                    viewport_layout_.pos.x + viewport_layout_.size.x - panel_input.screen_x);
                 rml_menu_bar_.draw(panel_input.screen_w, panel_input.screen_h);
             }
             if (global_context_menu_->hasPendingRenderWork()) {
