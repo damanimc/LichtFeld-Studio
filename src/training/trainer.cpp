@@ -326,7 +326,7 @@ namespace lfs::training {
             const auto mask_mode = opt_params.mask_mode;
             const bool use_masking =
                 mask_mode == lfs::core::param::MaskMode::Segment ||
-                mask_mode == lfs::core::param::MaskMode::Ignore  ||
+                mask_mode == lfs::core::param::MaskMode::Ignore ||
                 mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore;
 
             // Sidecar mask file wins when present; alpha-as-mask is only used as fallback
@@ -1443,8 +1443,8 @@ namespace lfs::training {
         const Tensor mask_2d = mask.ndim() == 3 ? mask.squeeze(0) : mask;
         Tensor mask_2d_th = mask_2d;
         if (mode == param::MaskMode::SegmentAndIgnore) {
-            mask_2d_th = mask_2d_th.masked_fill(mask_2d_th <= 250, 0);   // Set all Ignore and Segment to 0
-            mask_2d_th = mask_2d_th.masked_fill(mask_2d_th > 250, 255);  // Keep everything > 250
+            mask_2d_th = mask_2d_th.masked_fill(mask_2d_th <= 250, 0);  // Set all Ignore and Segment to 0
+            mask_2d_th = mask_2d_th.masked_fill(mask_2d_th > 250, 255); // Keep everything > 250
         }
 
         const auto mask_as_float = [](const Tensor t) -> Tensor {
@@ -3242,7 +3242,7 @@ namespace lfs::training {
                     const bool used_masked_fused =
                         use_mask &&
                         (params_.optimization.mask_mode == lfs::core::param::MaskMode::Segment ||
-                         params_.optimization.mask_mode == lfs::core::param::MaskMode::Ignore  ||
+                         params_.optimization.mask_mode == lfs::core::param::MaskMode::Ignore ||
                          params_.optimization.mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore) &&
                         params_.optimization.lambda_dssim > 0.0f;
                     {
