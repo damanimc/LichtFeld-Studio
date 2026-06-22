@@ -4,11 +4,14 @@
 </head>
 <body id="body" data-model="menu_bar">
     <div id="menu-row">
-        <div id="menu-items">
-            <span class="menu-label"
-                  data-for="menu : menu_labels"
-                  data-class-active="menu.active"
-                  data-attr-data-index="menu.index">{{ menu.label }}</span>
+        <div id="menu-left">
+            <img id="brand-logo" />
+            <div id="menu-items">
+                <span class="menu-label"
+                      data-for="menu : menu_labels"
+                      data-class-active="menu.active"
+                      data-attr-data-index="menu.index">{{ menu.label }}</span>
+            </div>
         </div>
         <div id="menu-toolbar">
             <div class="icon-btn menu-toolbar-btn"
@@ -33,7 +36,28 @@
                 <img data-attr-src="button.icon_src" />
             </div>
         </div>
-        <img id="brand-logo" />
+        <div id="menu-right">
+            <div id="menu-window-controls">
+                <div id="menu-window-minimize"
+                     class="icon-btn menu-window-btn"
+                     data-action="window_minimize"
+                     title="Minimize">
+                    <img src="../icon/arrows-minimize.png" />
+                </div>
+                <div id="menu-window-maximize"
+                     class="icon-btn menu-window-btn"
+                     data-action="window_toggle_maximize"
+                     title="Maximize / Restore">
+                    <img src="../icon/arrows-maximize.png" />
+                </div>
+                <div id="menu-window-close"
+                     class="icon-btn menu-window-btn menu-window-close"
+                     data-action="window_close"
+                     title="Close">
+                    <img src="../icon/scene/x.png" />
+                </div>
+            </div>
+        </div>
     </div>
     <div id="bottom-border"></div>
     <div id="dropdown-overlay"></div>

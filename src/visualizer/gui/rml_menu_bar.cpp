@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/rml_menu_bar.hpp"
-#include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/services.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
@@ -18,7 +17,7 @@
 #include "rendering/dirty_flags.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "rendering/rendering_types.hpp"
-#include "theme/theme.hpp"
+#include "window/window_manager.hpp"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
@@ -267,6 +266,7 @@ namespace lfs::vis::gui {
         dropdown_popup_ = document_->GetElementById("dropdown-popup");
         brand_logo_ = document_->GetElementById("brand-logo");
         menu_toolbar_ = document_->GetElementById("menu-toolbar");
+        menu_window_controls_ = document_->GetElementById("menu-window-controls");
         body_el_ = document_->GetElementById("body");
 
         render_needed_ = true;
@@ -292,6 +292,7 @@ namespace lfs::vis::gui {
         dropdown_overlay_ = nullptr;
         brand_logo_ = nullptr;
         menu_toolbar_ = nullptr;
+        menu_window_controls_ = nullptr;
         body_el_ = nullptr;
     }
 
@@ -302,6 +303,10 @@ namespace lfs::vis::gui {
         last_mouse_y_ = 0;
         last_hovered_label_ = -1;
         last_toolbar_hovered_ = false;
+        titlebar_drag_pending_ = false;
+        has_titlebar_click_ = false;
+        if (auto* wm = lfs::vis::services().windowOrNull(); wm && wm->isWindowDragActive())
+            wm->endWindowDrag();
         tooltip_.setHover({}, nullptr);
 
         if (open_menu_index_ >= 0)
@@ -327,8 +332,13 @@ namespace lfs::vis::gui {
         dropdown_overlay_ = nullptr;
         brand_logo_ = nullptr;
         menu_toolbar_ = nullptr;
+        menu_window_controls_ = nullptr;
         body_el_ = nullptr;
         tooltip_.setHover({}, nullptr);
+        titlebar_drag_pending_ = false;
+        has_titlebar_click_ = false;
+        if (auto* wm = lfs::vis::services().windowOrNull(); wm && wm->isWindowDragActive())
+            wm->endWindowDrag();
         base_rcss_.clear();
         has_theme_signature_ = false;
         wants_input_ = false;
@@ -360,6 +370,7 @@ namespace lfs::vis::gui {
         dropdown_popup_ = document_->GetElementById("dropdown-popup");
         brand_logo_ = document_->GetElementById("brand-logo");
         menu_toolbar_ = document_->GetElementById("menu-toolbar");
+        menu_window_controls_ = document_->GetElementById("menu-window-controls");
         body_el_ = document_->GetElementById("body");
         applied_toolbar_right_ = -1.0f;
 
@@ -477,6 +488,73 @@ namespace lfs::vis::gui {
             tooltip_.setHover(resolveRmlTooltip(hovered_toolbar_btn), hovered_toolbar_btn);
         else
             tooltip_.setHover({}, nullptr);
+
+        const float dp_ratio = rml_manager_ ? rml_manager_->getDpRatio() : 1.0f;
+        constexpr float kDoubleClickSeconds = 0.35f;
+        constexpr float kDoubleClickDistancePx = 6.0f;
+        constexpr float kDragStartDistancePx = 4.0f;
+        const bool in_free_titlebar =
+            !is_open &&
+            hovered_label < 0 &&
+            !hovered_toolbar_btn &&
+            my >= 0.0f &&
+            my < bar_height_ * dp_ratio;
+        if (auto* wm = lfs::vis::services().windowOrNull(); wm && wm->isWindowDragActive()) {
+            if (input.mouse_down[0]) {
+                wm->updateWindowDrag();
+                wants_input_ = true;
+                return;
+            }
+            wm->endWindowDrag();
+        }
+        if (titlebar_drag_pending_) {
+            wants_input_ = true;
+            if (!input.mouse_down[0]) {
+                titlebar_drag_pending_ = false;
+                return;
+            }
+
+            const float dx = mx - titlebar_drag_start_x_;
+            const float dy = my - titlebar_drag_start_y_;
+            if ((dx * dx + dy * dy) >= (kDragStartDistancePx * kDragStartDistancePx)) {
+                titlebar_drag_pending_ = false;
+                if (auto* wm = lfs::vis::services().windowOrNull()) {
+                    wm->beginWindowDrag();
+                    wm->updateWindowDrag();
+                }
+            }
+            return;
+        }
+        if (input.mouse_clicked[0] && in_free_titlebar) {
+            const auto now = std::chrono::steady_clock::now();
+            const float dx = mx - last_titlebar_click_x_;
+            const float dy = my - last_titlebar_click_y_;
+            const bool is_double_click =
+                has_titlebar_click_ &&
+                std::chrono::duration<float>(now - last_titlebar_click_time_).count() <= kDoubleClickSeconds &&
+                (dx * dx + dy * dy) <= (kDoubleClickDistancePx * kDoubleClickDistancePx);
+
+            if (is_double_click) {
+                if (auto* wm = lfs::vis::services().windowOrNull())
+                    wm->toggleMaximized();
+                has_titlebar_click_ = false;
+                wants_input_ = true;
+                return;
+            }
+
+            titlebar_drag_pending_ = true;
+            titlebar_drag_start_x_ = mx;
+            titlebar_drag_start_y_ = my;
+            last_titlebar_click_time_ = now;
+            last_titlebar_click_x_ = mx;
+            last_titlebar_click_y_ = my;
+            has_titlebar_click_ = true;
+            wants_input_ = true;
+            return;
+        } else if (input.mouse_clicked[0]) {
+            titlebar_drag_pending_ = false;
+            has_titlebar_click_ = false;
+        }
 
         if (is_open) {
             wants_input_ = true;
@@ -768,24 +846,41 @@ namespace lfs::vis::gui {
         } else if (action == "toggle_independent_split_view") {
             if (auto* ic = lfs::vis::InputController::instance())
                 ic->toggleIndependentSplitView();
+        } else if (action == "window_minimize") {
+            if (auto* wm = lfs::vis::services().windowOrNull())
+                wm->minimize();
+        } else if (action == "window_toggle_maximize") {
+            if (auto* wm = lfs::vis::services().windowOrNull())
+                wm->toggleMaximized();
+        } else if (action == "window_close") {
+            if (auto* wm = lfs::vis::services().windowOrNull()) {
+                wm->requestClose();
+                wm->wakeEventLoop();
+            }
         }
 
         render_needed_ = true;
     }
 
     Rml::Element* RmlMenuBar::toolbarButtonAtPoint(const float x, const float y) const {
-        if (!menu_toolbar_)
+        const auto find_button = [x, y](Rml::Element* root) -> Rml::Element* {
+            if (!root)
+                return nullptr;
+            for (int i = 0; i < root->GetNumChildren(); ++i) {
+                auto* child = root->GetChild(i);
+                if (!child->HasAttribute("data-action"))
+                    continue;
+                const auto box = child->GetAbsoluteOffset(Rml::BoxArea::Border);
+                const auto size = child->GetBox().GetSize(Rml::BoxArea::Border);
+                if (x >= box.x && x < box.x + size.x && y >= box.y && y < box.y + size.y)
+                    return child;
+            }
             return nullptr;
-        for (int i = 0; i < menu_toolbar_->GetNumChildren(); ++i) {
-            auto* child = menu_toolbar_->GetChild(i);
-            if (!child->HasAttribute("data-action"))
-                continue;
-            const auto box = child->GetAbsoluteOffset(Rml::BoxArea::Border);
-            const auto size = child->GetBox().GetSize(Rml::BoxArea::Border);
-            if (x >= box.x && x < box.x + size.x && y >= box.y && y < box.y + size.y)
-                return child;
-        }
-        return nullptr;
+        };
+
+        if (auto* button = find_button(menu_toolbar_))
+            return button;
+        return find_button(menu_window_controls_);
     }
 
     void RmlMenuBar::rebuildDropdownDOM() {
@@ -826,17 +921,10 @@ namespace lfs::vis::gui {
         rml_theme::applyTheme(document_, base_rcss_, rml_theme::loadBaseRCSS("rmlui/menubar.theme.rcss"));
 
         if (brand_logo_) {
-            const bool is_light = theme().isLightTheme();
-            const auto logo_path = lfs::vis::getAssetPath(
-                is_light ? "lichtfeld-splash-logo-dark.png" : "lichtfeld-splash-logo.png");
+            const auto logo_path = lfs::vis::getAssetPath("lichtfeld-icon.png");
             brand_logo_->SetAttribute("src", rml_theme::pathToRmlImageSource(logo_path));
-            auto [w, h, c] = lfs::core::get_image_info(logo_path);
-            if (w > 0 && h > 0) {
-                constexpr float kTargetHeightDp = 18.0f;
-                const float scale = kTargetHeightDp / static_cast<float>(h);
-                brand_logo_->SetProperty("width", std::format("{:.0f}dp", w * scale));
-                brand_logo_->SetProperty("height", std::format("{:.0f}dp", kTargetHeightDp));
-            }
+            brand_logo_->SetProperty("width", "20dp");
+            brand_logo_->SetProperty("height", "20dp");
         }
         return true;
     }
@@ -852,14 +940,14 @@ namespace lfs::vis::gui {
         const float dp_ratio = rml_manager_->getDpRatio();
         const int bar_h = static_cast<int>(bar_height_ * dp_ratio);
 
-        // Right-align the toolbar to the viewport's right edge (just before the
-        // dock panel) rather than the full-width bar edge. A small inset keeps
-        // the buttons off the panel boundary.
+        // Right-align the render/projection toolbar to the viewport edge, but
+        // keep it clear of the window-control cluster when there is no dock panel.
         if (menu_toolbar_) {
             const float inset = 8.0f * dp_ratio;
-            float right_px = 12.0f * dp_ratio;
+            constexpr float kRightClusterReserveDp = 116.0f;
+            float right_px = kRightClusterReserveDp * dp_ratio;
             if (viewport_right_edge_ > 0.0f)
-                right_px = std::max(0.0f, static_cast<float>(screen_w) - viewport_right_edge_ + inset);
+                right_px = std::max(right_px, static_cast<float>(screen_w) - viewport_right_edge_ + inset);
             if (std::abs(right_px - applied_toolbar_right_) > 0.5f) {
                 menu_toolbar_->SetProperty("right", std::format("{:.1f}px", right_px));
                 applied_toolbar_right_ = right_px;

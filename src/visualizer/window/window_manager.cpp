@@ -112,6 +112,43 @@ namespace lfs::vis {
             return haystack && needle && std::strstr(haystack, needle) != nullptr;
         }
 
+        SDL_HitTestResult SDLCALL borderlessWindowHitTest(SDL_Window* window, const SDL_Point* const area, void* data) {
+            const auto* const self = static_cast<WindowManager*>(data);
+            if (!self || !area)
+                return SDL_HITTEST_NORMAL;
+            if (self->isFullscreen() || self->isMaximized())
+                return SDL_HITTEST_NORMAL;
+
+            glm::ivec2 size = self->getWindowSize();
+            if (window)
+                SDL_GetWindowSize(window, &size.x, &size.y);
+            constexpr int kResizeBorder = 6;
+
+            const bool left = area->x >= 0 && area->x < kResizeBorder;
+            const bool right = area->x >= size.x - kResizeBorder && area->x < size.x;
+            const bool top = area->y >= 0 && area->y < kResizeBorder;
+            const bool bottom = area->y >= size.y - kResizeBorder && area->y < size.y;
+
+            if (top && left)
+                return SDL_HITTEST_RESIZE_TOPLEFT;
+            if (top && right)
+                return SDL_HITTEST_RESIZE_TOPRIGHT;
+            if (bottom && left)
+                return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+            if (bottom && right)
+                return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+            if (left)
+                return SDL_HITTEST_RESIZE_LEFT;
+            if (right)
+                return SDL_HITTEST_RESIZE_RIGHT;
+            if (top)
+                return SDL_HITTEST_RESIZE_TOP;
+            if (bottom)
+                return SDL_HITTEST_RESIZE_BOTTOM;
+
+            return SDL_HITTEST_NORMAL;
+        }
+
         bool shouldPreferX11OnGnome() {
 #if defined(__linux__)
             // GNOME on Wayland can present undecorated SDL toplevels when the
@@ -205,12 +242,17 @@ namespace lfs::vis {
             title_.c_str(),
             window_size_.x,
             window_size_.y,
-            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
+            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN |
+                SDL_WINDOW_BORDERLESS);
 
         if (!window_) {
             std::cerr << "Failed to create SDL window: " << SDL_GetError() << std::endl;
             SDL_Quit();
             return false;
+        }
+
+        if (!SDL_SetWindowHitTest(window_, borderlessWindowHitTest, this)) {
+            LOG_DEBUG("SDL window hit testing unavailable: {}", SDL_GetError());
         }
 
         // Position window on specified monitor (if provided)
@@ -369,18 +411,21 @@ namespace lfs::vis {
 
         switch (event.type) {
         case SDL_EVENT_QUIT:
+            endWindowDrag();
             should_close_ = true;
             break;
 
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             if (!eventTargetsWindow(event, main_window_id))
                 break;
+            endWindowDrag();
             should_close_ = true;
             break;
 
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             if (!eventTargetsWindow(event, main_window_id))
                 break;
+            endWindowDrag();
             lfs::core::events::internal::WindowFocusLost{}.emit();
             input_router_.onWindowFocusLost();
             if (input_controller_) {
@@ -404,6 +449,8 @@ namespace lfs::vis {
         case SDL_EVENT_WINDOW_RESTORED:
             if (!eventTargetsWindow(event, main_window_id))
                 break;
+            if (event.type == SDL_EVENT_WINDOW_MINIMIZED)
+                endWindowDrag();
             LOG_DEBUG("SDL window event: {} data1={} data2={} fullscreen={}",
                       windowEventName(event.type),
                       event.window.data1,
@@ -415,6 +462,7 @@ namespace lfs::vis {
         case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
             if (!eventTargetsWindow(event, main_window_id))
                 break;
+            endWindowDrag();
             is_fullscreen_ = true;
             LOG_DEBUG("SDL window event: {} data1={} data2={}",
                       windowEventName(event.type),
@@ -512,6 +560,7 @@ namespace lfs::vis {
     void WindowManager::setFullscreen(const bool fullscreen) {
         if (!window_)
             return;
+        endWindowDrag();
 
         LOG_DEBUG("setFullscreen request: target={}, current={}, logical={}x{}, framebuffer={}x{}",
                   fullscreen,
@@ -556,6 +605,71 @@ namespace lfs::vis {
 
         updateWindowSize(fullscreen ? "setFullscreen-enter" : "setFullscreen-leave");
         wakeEventLoop();
+    }
+
+    bool WindowManager::isMaximized() const {
+        return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_MAXIMIZED) != 0;
+    }
+
+    void WindowManager::minimize() {
+        if (!window_)
+            return;
+        endWindowDrag();
+        if (!SDL_MinimizeWindow(window_))
+            LOG_WARN("Failed to minimize window: {}", SDL_GetError());
+    }
+
+    void WindowManager::toggleMaximized() {
+        if (!window_)
+            return;
+        endWindowDrag();
+
+        if (isMaximized()) {
+            if (!SDL_RestoreWindow(window_)) {
+                LOG_WARN("Failed to restore window: {}", SDL_GetError());
+                return;
+            }
+        } else {
+            if (!SDL_MaximizeWindow(window_)) {
+                LOG_WARN("Failed to maximize window: {}", SDL_GetError());
+                return;
+            }
+        }
+
+        updateWindowSize(isMaximized() ? "toggleMaximized-maximize" : "toggleMaximized-restore");
+        wakeEventLoop();
+    }
+
+    void WindowManager::beginWindowDrag() {
+        if (!window_ || is_fullscreen_)
+            return;
+
+        if (isMaximized()) {
+            if (!SDL_RestoreWindow(window_)) {
+                LOG_WARN("Failed to restore window before drag: {}", SDL_GetError());
+                manual_window_drag_active_ = false;
+                return;
+            }
+            updateWindowSize("beginWindowDrag-restore");
+        }
+
+        SDL_GetWindowPosition(window_, &manual_drag_window_pos_.x, &manual_drag_window_pos_.y);
+        SDL_GetGlobalMouseState(&manual_drag_mouse_pos_.x, &manual_drag_mouse_pos_.y);
+        manual_window_drag_active_ = true;
+    }
+
+    void WindowManager::updateWindowDrag() {
+        if (!window_ || !manual_window_drag_active_)
+            return;
+
+        glm::vec2 mouse_pos{0.0f, 0.0f};
+        SDL_GetGlobalMouseState(&mouse_pos.x, &mouse_pos.y);
+        const glm::ivec2 next_pos = manual_drag_window_pos_ + glm::ivec2(glm::round(mouse_pos - manual_drag_mouse_pos_));
+        SDL_SetWindowPosition(window_, next_pos.x, next_pos.y);
+    }
+
+    void WindowManager::endWindowDrag() {
+        manual_window_drag_active_ = false;
     }
 
 } // namespace lfs::vis

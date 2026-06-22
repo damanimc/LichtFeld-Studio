@@ -49,6 +49,13 @@ namespace lfs::vis {
         glm::ivec2 getWindowSize() const { return window_size_; }
         glm::ivec2 getFramebufferSize() const { return framebuffer_size_; }
         bool isFullscreen() const { return is_fullscreen_; }
+        bool isMaximized() const;
+        void minimize();
+        void toggleMaximized();
+        bool isWindowDragActive() const { return manual_window_drag_active_; }
+        void beginWindowDrag();
+        void updateWindowDrag();
+        void endWindowDrag();
         void setFullscreen(bool fullscreen);
         GraphicsBackend graphicsBackend() const { return graphics_backend_; }
         bool isVulkan() const { return true; }
@@ -74,6 +81,9 @@ namespace lfs::vis {
         bool is_fullscreen_ = false;
         glm::ivec2 windowed_pos_{0, 0};
         glm::ivec2 windowed_size_{1280, 720};
+        bool manual_window_drag_active_ = false;
+        glm::ivec2 manual_drag_window_pos_{0, 0};
+        glm::vec2 manual_drag_mouse_pos_{0.0f, 0.0f};
         bool should_close_ = false;
 
         static void* callback_handler_;

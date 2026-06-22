@@ -149,6 +149,7 @@ namespace lfs::vis::gui {
         Rml::Element* dropdown_overlay_ = nullptr;
         Rml::Element* brand_logo_ = nullptr;
         Rml::Element* menu_toolbar_ = nullptr;
+        Rml::Element* menu_window_controls_ = nullptr;
         Rml::Element* body_el_ = nullptr;
         RmlTooltipController tooltip_;
         float viewport_right_edge_ = 0.0f;
@@ -164,6 +165,13 @@ namespace lfs::vis::gui {
         int last_mouse_y_ = 0;
         int last_hovered_label_ = -1;
         bool last_toolbar_hovered_ = false;
+        bool titlebar_drag_pending_ = false;
+        float titlebar_drag_start_x_ = 0.0f;
+        float titlebar_drag_start_y_ = 0.0f;
+        bool has_titlebar_click_ = false;
+        std::chrono::steady_clock::time_point last_titlebar_click_time_{};
+        float last_titlebar_click_x_ = 0.0f;
+        float last_titlebar_click_y_ = 0.0f;
         int last_ctx_w_ = 0;
         int last_ctx_h_ = 0;
         int last_document_h_ = 0;
