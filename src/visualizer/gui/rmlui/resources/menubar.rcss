@@ -39,7 +39,7 @@ body {
     align-items: center;
     flex: none;
     height: 30dp;
-    margin-right: 8dp;
+    margin-right: 0;
 }
 
 #brand-logo {
